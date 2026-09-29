@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -27,25 +28,31 @@ type FileEvent struct {
 }
 
 type Watcher struct {
-	root          string
-	watcher       *fsnotify.Watcher
-	addWatch      func(string) error
-	statPath      func(string) (fs.FileInfo, error)
-	relPath       func(string, string) (string, error)
-	backendEvents <-chan fsnotify.Event
-	backendErrors <-chan error
-	ignore        *indexer.IgnoreMatcher
-	debounceMs    int
-	events        chan FileEvent
-	errors        chan error
-	done          chan struct{}
-	stopOnce      sync.Once
-	closeOnce     sync.Once
-	closeErr      error
-	stateMu       sync.Mutex
-	ownerStopped  bool
-	fatalErr      error
-	fatalOnce     sync.Once
+	root        string
+	backend     *Backend
+	ownsBackend bool
+	// subscriberEvents/subscriberErrors are fed by the shared Backend's
+	// dispatcher; backendEvents/backendErrors read from them (tests may swap
+	// in their own channels).
+	subscriberEvents chan fsnotify.Event
+	subscriberErrors chan error
+	addWatch         func(string) error
+	statPath         func(string) (fs.FileInfo, error)
+	relPath          func(string, string) (string, error)
+	backendEvents    <-chan fsnotify.Event
+	backendErrors    <-chan error
+	ignore           *indexer.IgnoreMatcher
+	debounceMs       int
+	events           chan FileEvent
+	errors           chan error
+	done             chan struct{}
+	stopOnce         sync.Once
+	closeOnce        sync.Once
+	closeErr         error
+	stateMu          sync.Mutex
+	ownerStopped     bool
+	fatalErr         error
+	fatalOnce        sync.Once
 
 	processingDone chan struct{}
 
@@ -55,28 +62,46 @@ type Watcher struct {
 	timer     *time.Timer
 }
 
+// NewWatcher creates a watcher with its own private fsnotify instance. Use
+// NewWatcherWithBackend when several roots are watched by one process so they
+// share a single instance.
 func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Watcher, error) {
-	fsw, err := fsnotify.NewWatcher()
+	backend, err := NewBackend()
 	if err != nil {
-		return nil, &RegistrationError{Operation: "create filesystem watcher", Path: root, Cause: err}
+		var registration *RegistrationError
+		if errors.As(err, &registration) {
+			registration.Path = root
+		}
+		return nil, err
 	}
+	w := NewWatcherWithBackend(root, ignore, debounceMs, backend)
+	w.ownsBackend = true
+	return w, nil
+}
 
+// NewWatcherWithBackend creates a watcher whose directory registrations and
+// events go through a Backend shared with other watchers. Close detaches the
+// watcher from the backend but leaves the backend open for the others.
+func NewWatcherWithBackend(root string, ignore *indexer.IgnoreMatcher, debounceMs int, backend *Backend) *Watcher {
 	w := &Watcher{
-		root:       root,
-		watcher:    fsw,
-		ignore:     ignore,
-		debounceMs: debounceMs,
-		events:     make(chan FileEvent, 100),
-		errors:     make(chan error, 1),
-		done:       make(chan struct{}),
-		pending:    make(map[string]FileEvent),
+		root:             root,
+		backend:          backend,
+		subscriberEvents: make(chan fsnotify.Event, subscriberEventBuffer),
+		subscriberErrors: make(chan error, 1),
+		ignore:           ignore,
+		debounceMs:       debounceMs,
+		events:           make(chan FileEvent, 100),
+		errors:           make(chan error, 1),
+		done:             make(chan struct{}),
+		pending:          make(map[string]FileEvent),
 	}
-	w.addWatch = fsw.Add
+	w.addWatch = backend.Add
 	w.statPath = os.Stat
 	w.relPath = filepath.Rel
-	w.backendEvents = fsw.Events
-	w.backendErrors = fsw.Errors
-	return w, nil
+	w.backendEvents = w.subscriberEvents
+	w.backendErrors = w.subscriberErrors
+	backend.subscribe(w)
+	return w
 }
 
 func (w *Watcher) Start(ctx context.Context) error {
@@ -121,7 +146,13 @@ func (w *Watcher) Ready(publish func() error) error {
 func (w *Watcher) Close() error {
 	w.closeOnce.Do(func() {
 		w.Abort()
-		w.closeErr = w.watcher.Close()
+		if w.backend == nil {
+			return
+		}
+		w.backend.unsubscribe(w)
+		if w.ownsBackend {
+			w.closeErr = w.backend.Close()
+		}
 	})
 	return w.closeErr
 }

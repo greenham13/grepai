@@ -55,7 +55,7 @@ func TestStartAddENOSPCFailsAndAbortsWatcher(t *testing.T) {
 	if w.processingDone != nil {
 		t.Fatal("Start() launched event processing after registration failure")
 	}
-	if err := w.watcher.Add(root); err != nil {
+	if err := w.backend.Add(root); err != nil {
 		t.Fatalf("fatal abort closed fsnotify backend: %v", err)
 	}
 	if err := w.Close(); err != nil {

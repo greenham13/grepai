@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -143,7 +142,10 @@ func TestMonitorWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 	awaitWatchTestSignal(t, done, "workspace fatal monitor return")
 }
 
-func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *testing.T) {
+// A project whose live watch cannot be registered (inotify limits) keeps its
+// runtime and is indexed without live events; the other projects' watchers
+// are untouched and the workspace keeps running.
+func TestInitializeWorkspaceRuntimesRegistrationFailureKeepsIndexingWithoutLiveEvents(t *testing.T) {
 	first := newNonCooperativeCloseWatchSource()
 	defer close(first.blockClose)
 	symbolPath := filepath.Join(t.TempDir(), "symbols.gob")
@@ -151,35 +153,48 @@ func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *tes
 	ws := &config.Workspace{Projects: []config.ProjectEntry{
 		{Name: "first", Path: "/first"},
 		{Name: "second", Path: "/second"},
+		{Name: "third", Path: "/third"},
 	}}
-	initCalls := 0
-	initFn := func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, bool) (*workspaceProjectRuntime, watchSource, error) {
-		initCalls++
-		if initCalls == 1 {
-			return &workspaceProjectRuntime{project: ws.Projects[0], watcher: first, symbolStore: symbolStore}, first, nil
+	third := newFakeWatchSource()
+	initFn := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ *watcher.Backend, _ bool) (*workspaceProjectRuntime, watchSource, error) {
+		switch project.Name {
+		case "first":
+			return &workspaceProjectRuntime{project: project, watcher: first, symbolStore: symbolStore}, first, nil
+		case "second":
+			return &workspaceProjectRuntime{project: project}, nil, &watcher.RegistrationError{Operation: "add watch", Path: "/second", Cause: syscall.EMFILE}
+		default:
+			return &workspaceProjectRuntime{project: project, watcher: third}, third, nil
 		}
-		return nil, nil, &watcher.RegistrationError{Operation: "add watch", Path: "/second", Cause: syscall.ENOSPC}
 	}
 
-	result := make(chan error, 1)
-	go func() {
-		_, _, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, false, initFn)
-		result <- err
-	}()
-	var err error
-	select {
-	case <-first.closeStarted:
-		t.Fatal("registration failure invoked non-cooperative watcher Close")
-	case err = <-result:
+	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, nil, false, initFn)
+	if err != nil {
+		t.Fatalf("initializeWorkspaceRuntimes() error = %v, want nil (one project without live watching is not fatal)", err)
 	}
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("initializeWorkspaceRuntimes() error = %v, want ENOSPC", err)
+	if len(runtimes) != 3 {
+		t.Fatalf("runtimes = %d, want 3 (the project without live watching is still indexed)", len(runtimes))
 	}
-	if first.aborted != 1 || first.closed != 0 {
-		t.Fatalf("prior watcher aborts/closes = %d/%d, want 1/0", first.aborted, first.closed)
+	if len(watchers) != 2 {
+		t.Fatalf("watch sources = %d, want 2", len(watchers))
 	}
-	if _, statErr := os.Stat(symbolPath); !os.IsNotExist(statErr) {
-		t.Fatalf("fatal workspace startup serialized symbol store: %v", statErr)
+	if second := runtimes[canonicalPath("/second")]; second == nil || second.watcher != nil {
+		t.Fatalf("degraded project runtime = %+v, want present with nil watcher", second)
+	}
+	if first.aborted != 0 || first.closed != 0 {
+		t.Fatalf("healthy watcher aborts/closes = %d/%d, want 0/0", first.aborted, first.closed)
+	}
+}
+
+// An initializer that fails before it has a runtime (store, ignore matcher)
+// still only skips that project.
+func TestInitializeWorkspaceRuntimesSkipsProjectWithoutRuntime(t *testing.T) {
+	ws := &config.Workspace{Projects: []config.ProjectEntry{{Name: "broken", Path: "/broken"}}}
+	initFn := func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, *watcher.Backend, bool) (*workspaceProjectRuntime, watchSource, error) {
+		return nil, nil, &watcher.RegistrationError{Operation: "add watch", Path: "/broken", Cause: syscall.ENOSPC}
+	}
+	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, nil, false, initFn)
+	if err != nil || len(runtimes) != 0 || len(watchers) != 0 {
+		t.Fatalf("got runtimes=%d watchers=%d err=%v, want 0/0/nil", len(runtimes), len(watchers), err)
 	}
 }
 
@@ -189,14 +204,14 @@ func TestInitializeWorkspaceRuntimesKeepsOptionalInitializationWarningBehavior(t
 		{Name: "healthy", Path: "/healthy"},
 	}}
 	healthy := newFakeWatchSource()
-	initFn := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ bool) (*workspaceProjectRuntime, watchSource, error) {
+	initFn := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ *watcher.Backend, _ bool) (*workspaceProjectRuntime, watchSource, error) {
 		if project.Name == "optional-failure" {
 			return nil, nil, errors.New("optional index initialization failed")
 		}
 		return &workspaceProjectRuntime{project: project, watcher: healthy}, healthy, nil
 	}
 
-	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, true, initFn)
+	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, nil, true, initFn)
 	if err != nil {
 		t.Fatalf("initializeWorkspaceRuntimes() error = %v", err)
 	}

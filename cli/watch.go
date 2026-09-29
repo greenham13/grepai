@@ -2853,7 +2853,21 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	abortStores := false
 	defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, st.Close) }()
 
-	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime)
+	// One fsnotify backend (one inotify instance) for every project in the
+	// workspace: per-project instances exhaust fs.inotify.max_user_instances
+	// (128 by default) once a workspace has more than about a hundred projects.
+	backend, err := watcher.NewBackend()
+	if err != nil {
+		abortStores = true
+		return fmt.Errorf("failed to create filesystem watcher for workspace %s: %w", ws.Name, err)
+	}
+	defer func() {
+		if err := backend.Close(); err != nil {
+			log.Printf("Warning: failed to close filesystem watcher: %v", err)
+		}
+	}()
+
+	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, backend, isBackgroundChild, initializeWorkspaceRuntime)
 	if err != nil {
 		abortStores = isFatalWatcherError(err)
 		return err
@@ -3012,7 +3026,12 @@ type workspaceProjectRuntime struct {
 	watcher         watchSource
 }
 
-func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool) (*workspaceProjectRuntime, watchSource, error) {
+// initializeWorkspaceRuntime builds one project's indexer, symbol/RPG stores
+// and live file watcher. Watch registrations share the workspace's single
+// fsnotify backend. When the live watcher cannot be registered, the runtime is
+// still returned (with a nil watcher) alongside the registration error so the
+// caller can keep indexing that project without live events.
+func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, backend *watcher.Backend, isBackgroundChild bool) (*workspaceProjectRuntime, watchSource, error) {
 	projectCfg := config.DefaultConfig()
 	if config.Exists(project.Path) {
 		loadedCfg, err := config.Load(project.Path)
@@ -3106,29 +3125,6 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		manager = newRPGRealtimeManager(projectCfg.Watch.RPGMaxDirtyFilesPerBatch)
 	}
 
-	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs)
-	if err != nil {
-		if !isFatalWatcherError(err) {
-			if rpgStore != nil {
-				_ = rpgStore.Close()
-			}
-			_ = symbolStore.Close()
-		}
-		return nil, nil, fmt.Errorf("failed to create watcher: %w", err)
-	}
-	if err := w.Start(ctx); err != nil {
-		if isFatalWatcherError(err) {
-			w.Abort()
-		} else {
-			_ = w.Close()
-			if rpgStore != nil {
-				_ = rpgStore.Close()
-			}
-			_ = symbolStore.Close()
-		}
-		return nil, nil, fmt.Errorf("failed to start watcher: %w", err)
-	}
-
 	runtime := &workspaceProjectRuntime{
 		project:         project,
 		cfg:             projectCfg,
@@ -3142,8 +3138,16 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		vectorStore:     vectorStore,
 		tracedLanguages: tracedLanguages,
 		manager:         manager,
-		watcher:         w,
 	}
+
+	w := watcher.NewWatcherWithBackend(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs, backend)
+	if err := w.Start(ctx); err != nil {
+		// Start already aborted the watcher; detach it from the shared backend
+		// (Close on a shared watcher does not close the backend).
+		_ = w.Close()
+		return runtime, nil, fmt.Errorf("failed to start watcher: %w", err)
+	}
+	runtime.watcher = w
 	return runtime, w, nil
 }
 

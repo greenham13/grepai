@@ -19,7 +19,7 @@ func TestAbortThenCloseIsSafeAndIdempotent(t *testing.T) {
 	if w.timer != nil {
 		t.Fatal("Abort did not clear debounce timer")
 	}
-	if err := w.watcher.Add(t.TempDir()); err != nil {
+	if err := w.backend.Add(t.TempDir()); err != nil {
 		t.Fatalf("Abort closed fsnotify backend: %v", err)
 	}
 
@@ -46,7 +46,7 @@ func TestAbortIsSafeConcurrentWithPublishFatalAndClose(t *testing.T) {
 	if !w.ownerStopped || !w.stopped() {
 		t.Fatal("concurrent fatal lifecycle did not stop watcher")
 	}
-	if err := w.watcher.Add(t.TempDir()); err == nil {
+	if err := w.backend.Add(t.TempDir()); err == nil {
 		t.Fatalf("Close did not close backend exactly once: %v", err)
 	}
 }

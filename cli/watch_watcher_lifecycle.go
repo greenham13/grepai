@@ -117,9 +117,14 @@ func monitorWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRunti
 	}
 }
 
-type workspaceRuntimeInitializer func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, bool) (*workspaceProjectRuntime, watchSource, error)
+type workspaceRuntimeInitializer func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, *watcher.Backend, bool) (*workspaceProjectRuntime, watchSource, error)
 
-func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool, initialize workspaceRuntimeInitializer) (map[string]*workspaceProjectRuntime, []watchSource, error) {
+// initializeWorkspaceRuntimes indexes every project and attaches live file
+// watching where the OS lets it. A project whose watch registration fails
+// (inotify limits, unreadable directories) keeps its runtime and is indexed
+// on every watcher start, without live updates in between; one project can
+// no longer take the whole workspace down.
+func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb embedder.Embedder, sharedStore store.VectorStore, backend *watcher.Backend, isBackgroundChild bool, initialize workspaceRuntimeInitializer) (map[string]*workspaceProjectRuntime, []watchSource, error) {
 	runtimes := make(map[string]*workspaceProjectRuntime, len(ws.Projects))
 	watchers := make([]watchSource, 0, len(ws.Projects))
 	for _, project := range ws.Projects {
@@ -128,18 +133,21 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 		} else {
 			log.Printf("Indexing project: %s (%s)", project.Name, project.Path)
 		}
-		runtime, w, err := initialize(ctx, ws, project, emb, sharedStore, isBackgroundChild)
+		runtime, w, err := initialize(ctx, ws, project, emb, sharedStore, backend, isBackgroundChild)
 		if err != nil {
-			var registrationErr *watcher.RegistrationError
-			if errors.As(err, &registrationErr) {
-				abortWatchSources(watchers)
-				return nil, nil, fmt.Errorf("failed to initialize watcher for project %s (%s): %w", project.Name, project.Path, err)
+			if runtime == nil {
+				log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
+				continue
 			}
-			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
+			log.Printf("Warning: live file watching is off for project %s (%s): %v. Its index still updates on every watcher start.", project.Name, project.Path, err)
+			runtime.watcher = nil
+			runtimes[canonicalPath(project.Path)] = runtime
 			continue
 		}
 		runtimes[canonicalPath(project.Path)] = runtime
-		watchers = append(watchers, w)
+		if w != nil {
+			watchers = append(watchers, w)
+		}
 	}
 	return runtimes, watchers, nil
 }
