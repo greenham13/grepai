@@ -13,6 +13,10 @@ import (
 
 func (w *Watcher) processEvents(ctx context.Context) {
 	defer close(w.processingDone)
+	// Once this loop stops reading, a shared backend must be able to skip this
+	// subscriber; otherwise a full subscriber buffer would stall delivery to
+	// every other root.
+	defer w.stop()
 	for {
 		select {
 		case <-ctx.Done():

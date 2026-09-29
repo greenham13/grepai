@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +13,8 @@ import (
 // shared dispatcher and a Watcher's processEvents loop.
 const subscriberEventBuffer = 1024
 
+var errBackendClosedForSubscribe = errors.New("shared filesystem watcher is closed")
+
 // Backend owns exactly one fsnotify.Watcher (one inotify instance on Linux,
 // one kqueue on BSD/macOS) and fans its events out to every Watcher that
 // subscribed to it. A workspace of N projects therefore costs one inotify
@@ -19,11 +22,15 @@ const subscriberEventBuffer = 1024
 // fs.inotify.max_user_instances cap (128 by default) that a per-project
 // fsnotify.Watcher exhausts once a workspace grows past roughly a hundred
 // projects.
+//
+// Directory registrations are reference counted: nested roots may register
+// the same directory, and it stays watched until the last of them removes it.
 type Backend struct {
 	fsw *fsnotify.Watcher
 
 	mu          sync.RWMutex
 	subscribers map[*Watcher]struct{}
+	refs        map[string]int
 	closed      bool
 
 	closeOnce    sync.Once
@@ -40,21 +47,59 @@ func NewBackend() (*Backend, error) {
 	b := &Backend{
 		fsw:          fsw,
 		subscribers:  make(map[*Watcher]struct{}),
+		refs:         make(map[string]int),
 		dispatchDone: make(chan struct{}),
 	}
 	go b.dispatch()
 	return b, nil
 }
 
-// Add registers one directory with the shared fsnotify instance.
+// Add registers one directory with the shared fsnotify instance, counting a
+// reference for the caller.
 func (b *Backend) Add(path string) error {
-	return b.fsw.Add(path)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return errBackendClosedForSubscribe
+	}
+	if b.refs[path] == 0 {
+		if err := b.fsw.Add(path); err != nil {
+			return err
+		}
+	}
+	b.refs[path]++
+	return nil
 }
 
+// Remove drops one reference to a directory and stops watching it when no
+// subscriber still needs it.
+func (b *Backend) Remove(path string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || b.refs[path] == 0 {
+		return nil
+	}
+	b.refs[path]--
+	if b.refs[path] > 0 {
+		return nil
+	}
+	delete(b.refs, path)
+	err := b.fsw.Remove(path)
+	if err != nil && (errors.Is(err, fsnotify.ErrNonExistentWatch) || os.IsNotExist(err)) {
+		return nil
+	}
+	return err
+}
+
+// subscribe attaches a watcher. On a closed backend the watcher's channels
+// are closed at once so its processEvents loop reports errBackendClosed
+// instead of waiting forever.
 func (b *Backend) subscribe(w *Watcher) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
+		close(w.subscriberEvents)
+		close(w.subscriberErrors)
 		return
 	}
 	b.subscribers[w] = struct{}{}
@@ -64,6 +109,19 @@ func (b *Backend) unsubscribe(w *Watcher) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	delete(b.subscribers, w)
+}
+
+// snapshot returns the current subscribers without holding the lock while
+// events are delivered, so subscribe/unsubscribe/Close never wait on a
+// slow subscriber.
+func (b *Backend) snapshot() []*Watcher {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	subscribers := make([]*Watcher, 0, len(b.subscribers))
+	for w := range b.subscribers {
+		subscribers = append(subscribers, w)
+	}
+	return subscribers
 }
 
 // dispatch is the only reader of the fsnotify channels. Each event is handed
@@ -80,23 +138,21 @@ func (b *Backend) dispatch() {
 				b.closeSubscriberChannels()
 				return
 			}
-			b.mu.RLock()
-			for w := range b.subscribers {
-				if rootContains(w.root, event.Name) {
-					select {
-					case w.subscriberEvents <- event:
-					case <-w.done:
-					}
+			for _, w := range b.snapshot() {
+				if !rootContains(w.root, event.Name) {
+					continue
+				}
+				select {
+				case w.subscriberEvents <- event:
+				case <-w.done:
 				}
 			}
-			b.mu.RUnlock()
 		case err, ok := <-b.fsw.Errors:
 			if !ok {
 				b.closeSubscriberChannels()
 				return
 			}
-			b.mu.RLock()
-			for w := range b.subscribers {
+			for _, w := range b.snapshot() {
 				select {
 				case w.subscriberErrors <- err:
 				case <-w.done:
@@ -104,7 +160,6 @@ func (b *Backend) dispatch() {
 					// A subscriber already holds an undelivered fatal error; one is enough.
 				}
 			}
-			b.mu.RUnlock()
 		}
 	}
 }

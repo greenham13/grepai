@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -210,5 +211,104 @@ func TestRootContains(t *testing.T) {
 		if got := rootContains(root, path); got != want {
 			t.Errorf("rootContains(%q, %q) = %v, want %v", root, path, got, want)
 		}
+	}
+}
+
+func TestSharedWatcherReleasesOnlyItsOwnWatches(t *testing.T) {
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := NewBackend()
+	if err != nil {
+		t.Fatalf("NewBackend() error = %v", err)
+	}
+	defer backend.Close()
+
+	outer := newSharedTestWatcher(t, backend, parent)
+	inner := newSharedTestWatcher(t, backend, child)
+	backend.mu.RLock()
+	if backend.refs[child] != 2 || backend.refs[parent] != 1 {
+		backend.mu.RUnlock()
+		t.Fatalf("refs = %v, want child 2, parent 1", backend.refs)
+	}
+	backend.mu.RUnlock()
+
+	if err := inner.Close(); err != nil {
+		t.Fatalf("Close(inner) error = %v", err)
+	}
+	backend.mu.RLock()
+	childRefs := backend.refs[child]
+	backend.mu.RUnlock()
+	if childRefs != 1 {
+		t.Fatalf("child refs after inner close = %d, want 1 (parent still watches it)", childRefs)
+	}
+	// The parent still receives events under child.
+	if err := os.WriteFile(filepath.Join(child, "still.go"), []byte("package child\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	awaitEvent(t, outer, filepath.Join("child", "still.go"))
+
+	if err := outer.Close(); err != nil {
+		t.Fatalf("Close(outer) error = %v", err)
+	}
+	backend.mu.RLock()
+	remaining := len(backend.refs)
+	backend.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("refs after both closed = %d, want 0", remaining)
+	}
+}
+
+func TestSharedWatcherFailedStartReleasesPartialWatches(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "a", "b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backend, err := NewBackend()
+	if err != nil {
+		t.Fatalf("NewBackend() error = %v", err)
+	}
+	defer backend.Close()
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewWatcherWithBackend(root, ignore, 0, backend)
+	original := w.addWatch
+	w.addWatch = func(path string) error {
+		if filepath.Base(path) == "b" {
+			return syscall.ENOSPC
+		}
+		return original(path)
+	}
+	if err := w.Start(context.Background()); err == nil {
+		t.Fatal("Start succeeded despite ENOSPC")
+	}
+	backend.mu.RLock()
+	remaining := len(backend.refs)
+	backend.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("refs after failed Start = %d, want 0", remaining)
+	}
+}
+
+func TestSubscribeToClosedBackendFailsFast(t *testing.T) {
+	backend, err := NewBackend()
+	if err != nil {
+		t.Fatalf("NewBackend() error = %v", err)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := NewWatcherWithBackend(root, ignore, 0, backend)
+	if err := w.Start(context.Background()); err == nil {
+		t.Fatal("Start on a closed backend must fail at registration")
 	}
 }

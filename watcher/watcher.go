@@ -36,23 +36,28 @@ type Watcher struct {
 	// in their own channels).
 	subscriberEvents chan fsnotify.Event
 	subscriberErrors chan error
-	addWatch         func(string) error
-	statPath         func(string) (fs.FileInfo, error)
-	relPath          func(string, string) (string, error)
-	backendEvents    <-chan fsnotify.Event
-	backendErrors    <-chan error
-	ignore           *indexer.IgnoreMatcher
-	debounceMs       int
-	events           chan FileEvent
-	errors           chan error
-	done             chan struct{}
-	stopOnce         sync.Once
-	closeOnce        sync.Once
-	closeErr         error
-	stateMu          sync.Mutex
-	ownerStopped     bool
-	fatalErr         error
-	fatalOnce        sync.Once
+	// watched records every directory this watcher registered on a shared
+	// backend so Close (or a failed Start) can release them; a private
+	// backend releases everything when its fsnotify instance closes.
+	watched       map[string]struct{}
+	watchedMu     sync.Mutex
+	addWatch      func(string) error
+	statPath      func(string) (fs.FileInfo, error)
+	relPath       func(string, string) (string, error)
+	backendEvents <-chan fsnotify.Event
+	backendErrors <-chan error
+	ignore        *indexer.IgnoreMatcher
+	debounceMs    int
+	events        chan FileEvent
+	errors        chan error
+	done          chan struct{}
+	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+	stateMu       sync.Mutex
+	ownerStopped  bool
+	fatalErr      error
+	fatalOnce     sync.Once
 
 	processingDone chan struct{}
 
@@ -94,8 +99,17 @@ func NewWatcherWithBackend(root string, ignore *indexer.IgnoreMatcher, debounceM
 		errors:           make(chan error, 1),
 		done:             make(chan struct{}),
 		pending:          make(map[string]FileEvent),
+		watched:          make(map[string]struct{}),
 	}
-	w.addWatch = backend.Add
+	w.addWatch = func(path string) error {
+		if err := backend.Add(path); err != nil {
+			return err
+		}
+		w.watchedMu.Lock()
+		w.watched[path] = struct{}{}
+		w.watchedMu.Unlock()
+		return nil
+	}
 	w.statPath = os.Stat
 	w.relPath = filepath.Rel
 	w.backendEvents = w.subscriberEvents
@@ -108,6 +122,9 @@ func (w *Watcher) Start(ctx context.Context) error {
 	// Add root directory and all subdirectories
 	if err := w.addRecursive(w.root, true); err != nil {
 		w.Abort()
+		// Half-registered directories would keep counting against the
+		// per-user watch limit for the whole workspace.
+		w.releaseWatches()
 		return err
 	}
 
@@ -152,9 +169,29 @@ func (w *Watcher) Close() error {
 		w.backend.unsubscribe(w)
 		if w.ownsBackend {
 			w.closeErr = w.backend.Close()
+			return
 		}
+		w.releaseWatches()
 	})
 	return w.closeErr
+}
+
+// releaseWatches drops this watcher's references on the shared backend.
+// Directories a nested or parent root still needs stay watched.
+func (w *Watcher) releaseWatches() {
+	if w.backend == nil || w.ownsBackend {
+		return
+	}
+	w.watchedMu.Lock()
+	paths := make([]string, 0, len(w.watched))
+	for path := range w.watched {
+		paths = append(paths, path)
+	}
+	w.watched = make(map[string]struct{})
+	w.watchedMu.Unlock()
+	for _, path := range paths {
+		_ = w.backend.Remove(path)
+	}
 }
 
 // Abort synchronously stops event ownership without closing the fsnotify

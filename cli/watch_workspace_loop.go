@@ -11,16 +11,21 @@ import (
 )
 
 type workspaceWatchLoop struct {
-	ctx               context.Context
-	store             store.VectorStore
-	runtimes          map[string]*workspaceProjectRuntime
-	watchers          []watchSource
-	fence             *watchMutationFence
-	events            <-chan workspaceWatchEvent
-	fatals            <-chan error
-	signals           <-chan os.Signal
-	stops             <-chan struct{}
-	persistTicks      <-chan time.Time
+	ctx          context.Context
+	store        store.VectorStore
+	runtimes     map[string]*workspaceProjectRuntime
+	watchers     []watchSource
+	fence        *watchMutationFence
+	events       <-chan workspaceWatchEvent
+	fatals       <-chan error
+	signals      <-chan os.Signal
+	stops        <-chan struct{}
+	persistTicks <-chan time.Time
+	// staleRescanEvery: every this many persist ticks, projects without a
+	// live watcher are rescanned so they do not stay stale until the next
+	// watcher start. 0 disables (tests).
+	staleRescanEvery  int
+	persistTickCount  int
 	stopForwarders    func()
 	stopWorkers       func()
 	workers           []watchMutationWorker
@@ -53,6 +58,42 @@ func (l *workspaceWatchLoop) gracefulShutdown(message string) error {
 	return nil
 }
 
+// projectsWithoutLiveWatch lists the runtimes whose watch registration failed.
+func projectsWithoutLiveWatch(runtimes map[string]*workspaceProjectRuntime) []*workspaceProjectRuntime {
+	var stale []*workspaceProjectRuntime
+	for _, runtime := range runtimes {
+		if runtime.watcher == nil {
+			stale = append(stale, runtime)
+		}
+	}
+	return stale
+}
+
+// rescanProjectsWithoutLiveWatch re-runs the initial scan for projects that
+// have no live watcher. Unchanged files are skipped by hash, so this costs a
+// metadata walk per project, not a re-embedding.
+func rescanProjectsWithoutLiveWatch(ctx context.Context, fence *watchMutationFence, runtimes map[string]*workspaceProjectRuntime) error {
+	stale := projectsWithoutLiveWatch(runtimes)
+	if len(stale) == 0 {
+		return nil
+	}
+	return fence.handle(ctx, func(scanCtx context.Context) {
+		for _, runtime := range stale {
+			if runtime.idx == nil {
+				continue
+			}
+			stats, err := runtime.idx.IndexAll(scanCtx)
+			if err != nil {
+				log.Printf("Warning: rescan of %s (no live file watching) failed: %v", runtime.project.Name, err)
+				continue
+			}
+			if stats.FilesIndexed > 0 || stats.FilesRemoved > 0 {
+				log.Printf("Rescanned %s (no live file watching): %d files indexed, %d removed", runtime.project.Name, stats.FilesIndexed, stats.FilesRemoved)
+			}
+		}
+	})
+}
+
 func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 	for {
 		select {
@@ -74,6 +115,15 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 					l.stopForwarders()
 				}
 				return fatal
+			}
+			l.persistTickCount++
+			if l.staleRescanEvery > 0 && l.persistTickCount%l.staleRescanEvery == 0 {
+				if err := rescanProjectsWithoutLiveWatch(l.ctx, l.fence, l.runtimes); err != nil {
+					if l.ctx.Err() != nil {
+						return l.gracefulShutdown("")
+					}
+					log.Printf("Warning: rescan of projects without live file watching failed: %v", err)
+				}
 			}
 		case err := <-l.fatals:
 			if l.stopForwarders != nil {

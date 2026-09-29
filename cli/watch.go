@@ -2773,6 +2773,10 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 	return nil
 }
 
+// staleRescanEveryTicks: projects without live file watching are rescanned
+// every this many 30-second persist ticks (10 = every 5 minutes).
+const staleRescanEveryTicks = 10
+
 func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2956,10 +2960,15 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	defer signal.Stop(sigChan)
 	wsStopCh := daemon.StopChannel()
 
+	staleCount := len(projectsWithoutLiveWatch(runtimes))
+	staleNote := ""
+	if staleCount > 0 {
+		staleNote = fmt.Sprintf(" (%d without live file watching; rescanned every %d min)", staleCount, staleRescanEveryTicks*30/60)
+	}
 	if !isBackgroundChild {
-		fmt.Printf("\nWatching %d projects for changes... (Press Ctrl+C to stop)\n", len(runtimes))
+		fmt.Printf("\nWatching %d projects for changes...%s (Press Ctrl+C to stop)\n", len(runtimes), staleNote)
 	} else {
-		log.Printf("Watching %d projects for changes...", len(runtimes))
+		log.Printf("Watching %d projects for changes...%s", len(runtimes), staleNote)
 	}
 
 	persistTicker := time.NewTicker(30 * time.Second)
@@ -2975,6 +2984,7 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		signals:           sigChan,
 		stops:             wsStopCh,
 		persistTicks:      persistTicker.C,
+		staleRescanEvery:  staleRescanEveryTicks,
 		stopForwarders:    stopForwarders,
 		stopWorkers:       stopWorkers,
 		workers:           workers,
