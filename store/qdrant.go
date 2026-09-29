@@ -99,13 +99,20 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 		}
 	}
 
-	// Create field index for content_hash to enable efficient lookups.
-	// Error is intentionally ignored because the index may already exist.
-	_, _ = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
-		CollectionName: s.collectionName,
-		FieldName:      "content_hash",
-		FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
-	})
+	// Create keyword field indexes for the payload fields grepai filters on:
+	// content_hash (embedding cache lookups) and file_path (GetDocument,
+	// DeleteByFile and prefix-filtered search). Without the file_path index
+	// every per-file lookup scans the whole collection, which on a ~100k-file
+	// index kept Qdrant at 100% of one core during indexing.
+	// Errors are intentionally ignored because the index may already exist.
+	for _, field := range []string{"content_hash", "file_path"} {
+		_, _ = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
+			CollectionName: s.collectionName,
+			FieldName:      field,
+			FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
+			Wait:           qdrant.PtrOf(true),
+		})
+	}
 
 	return nil
 }
@@ -129,7 +136,24 @@ func (s *QdrantStore) getUUIDForChunk(chunkID string) uuid.UUID {
 	return uuid.NewSHA1(namespace, []byte(chunkID))
 }
 
+// qdrantUpsertBatchSize bounds the number of points sent in one Upsert so a
+// cross-file batch of chunks stays within a reasonable gRPC message size.
+const qdrantUpsertBatchSize = 512
+
 func (s *QdrantStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
+	for start := 0; start < len(chunks); start += qdrantUpsertBatchSize {
+		end := start + qdrantUpsertBatchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		if err := s.upsertChunks(ctx, chunks[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *QdrantStore) upsertChunks(ctx context.Context, chunks []Chunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}

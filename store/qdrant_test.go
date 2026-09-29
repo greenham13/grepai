@@ -656,3 +656,101 @@ func TestQdrantStore_ConfigurationVariants(t *testing.T) {
 		})
 	}
 }
+
+// TestQdrantEnsureCollectionAndBatchedUpsert runs against a local Qdrant and
+// verifies that ensureCollection creates the file_path keyword index (so
+// per-file lookups do not scan the collection) and that SaveChunks with more
+// than qdrantUpsertBatchSize chunks lands every point.
+func TestQdrantEnsureCollectionAndBatchedUpsert(t *testing.T) {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:6333", time.Second)
+	if err != nil {
+		t.Skipf("local Qdrant unavailable: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	client, err := qdrant.NewClient(&qdrant.Config{Host: "127.0.0.1", Port: 6334})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	const collection = "test_grepai_batched_upsert"
+	exists, err := client.CollectionExists(ctx, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Fatal("test collection already exists; refusing to change an unowned collection")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if err := client.DeleteCollection(cleanupCtx, collection); err != nil {
+			t.Error(err)
+		}
+	})
+
+	s := &QdrantStore{client: client, collectionName: collection, dimensions: 3}
+	if err := s.ensureCollection(ctx); err != nil {
+		t.Fatal(err)
+	}
+	info, err := client.GetCollectionInfo(ctx, collection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"file_path", "content_hash"} {
+		schema, ok := info.GetPayloadSchema()[field]
+		if !ok {
+			t.Fatalf("payload index for %q missing; schema has %v", field, info.GetPayloadSchema())
+		}
+		if schema.GetDataType() != qdrant.PayloadSchemaType_Keyword {
+			t.Fatalf("%q index type = %v, want Keyword", field, schema.GetDataType())
+		}
+	}
+
+	const total = qdrantUpsertBatchSize*2 + 37
+	chunks := make([]Chunk, total)
+	for i := range chunks {
+		chunks[i] = Chunk{
+			ID:       fmt.Sprintf("chunk_%d", i),
+			FilePath: fmt.Sprintf("file%d.go", i%50),
+			FileHash: "fh",
+			Hash:     "h",
+			Content:  "content",
+			Vector:   []float32{1, 0, 0},
+		}
+	}
+	if err := s.SaveChunks(ctx, chunks); err != nil {
+		t.Fatal(err)
+	}
+	// Upserts are acknowledged before they are applied; count with an exact query.
+	deadline := time.Now().Add(20 * time.Second)
+	var count uint64
+	for time.Now().Before(deadline) {
+		res, err := client.Count(ctx, &qdrant.CountPoints{CollectionName: collection, Exact: qdrant.PtrOf(true)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		count = res
+		if count == total {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if count != total {
+		t.Fatalf("collection has %d points, want %d", count, total)
+	}
+	doc, err := s.GetDocument(ctx, "file7.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc == nil || doc.Hash != "fh" || len(doc.ChunkIDs) != total/50+1 {
+		t.Fatalf("unexpected document for file7.go: %+v", doc)
+	}
+}

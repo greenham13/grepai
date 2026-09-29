@@ -425,6 +425,67 @@ func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks [
 	return nil
 }
 
+// storeChunkFlushSize is the number of chunks the batched indexing path
+// accumulates across files before one SaveChunks call. One store write per
+// file made a ~100k-file index do ~100k round trips; buffering across files
+// cuts that by two orders of magnitude.
+const storeChunkFlushSize = 512
+
+// chunkWriteBuffer accumulates chunks and document records from several
+// files and writes them to the store in batches of storeChunkFlushSize
+// chunks. A flush saves the chunks first and the documents after, so the
+// store never holds a document record whose chunks were not written: a run
+// that fails mid-way leaves files without a document, and they are indexed
+// again next time, exactly as the per-file path behaves.
+type chunkWriteBuffer struct {
+	store        store.VectorStore
+	pendingChunk []store.Chunk
+	pendingDocs  []store.Document
+}
+
+func (b *chunkWriteBuffer) add(ctx context.Context, chunks []store.Chunk, doc store.Document) error {
+	b.pendingChunk = append(b.pendingChunk, chunks...)
+	b.pendingDocs = append(b.pendingDocs, doc)
+	if len(b.pendingChunk) >= storeChunkFlushSize {
+		return b.flush(ctx)
+	}
+	return nil
+}
+
+func (b *chunkWriteBuffer) flush(ctx context.Context) error {
+	if len(b.pendingChunk) == 0 && len(b.pendingDocs) == 0 {
+		return nil
+	}
+	if len(b.pendingChunk) > 0 {
+		if err := b.store.SaveChunks(ctx, b.pendingChunk); err != nil {
+			return fmt.Errorf("failed to save %d chunks for %d files: %w", len(b.pendingChunk), len(b.pendingDocs), err)
+		}
+	}
+	for _, doc := range b.pendingDocs {
+		if err := b.store.SaveDocument(ctx, doc); err != nil {
+			return fmt.Errorf("failed to save document for %s: %w", doc.Path, err)
+		}
+	}
+	b.pendingChunk = b.pendingChunk[:0]
+	b.pendingDocs = b.pendingDocs[:0]
+	return nil
+}
+
+// saveFileDataBuffered queues a file's chunks and document record for the
+// next batched store write.
+func (idx *Indexer) saveFileDataBuffered(ctx context.Context, buf *chunkWriteBuffer, fd fileChunkData, chunks []store.Chunk, chunkIDs []string) error {
+	doc := store.Document{
+		Path:     fd.file.Path,
+		Hash:     fd.file.Hash,
+		ModTime:  time.Unix(fd.file.ModTime, 0),
+		ChunkIDs: chunkIDs,
+	}
+	if err := buf.add(ctx, chunks, doc); err != nil {
+		return fmt.Errorf("failed to save %s: %w", fd.file.Path, err)
+	}
+	return nil
+}
+
 // wrapBatchProgress creates an embedder.BatchProgress callback from BatchProgressCallback.
 func wrapBatchProgress(onProgress BatchProgressCallback) embedder.BatchProgress {
 	if onProgress == nil {
@@ -518,11 +579,12 @@ func (idx *Indexer) indexFilesBatched(
 
 	// Save fully-cached files immediately
 	now := time.Now()
+	buf := &chunkWriteBuffer{store: idx.store}
 	for _, pf := range preFilledFiles {
 		fd := fileData[pf.fdIndex]
 		idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, pf.vectors, fd.file.Hash, now)
-		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+		if err := idx.saveFileDataBuffered(ctx, buf, fd, chunks, chunkIDs); err != nil {
 			return filesIndexed, chunksCreated, err
 		}
 		filesIndexed++
@@ -548,12 +610,16 @@ func (idx *Indexer) indexFilesBatched(
 			}
 			idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 			chunks, chunkIDs := createStoreChunks(fd.chunkInfos, embeddings, fd.file.Hash, now)
-			if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+			if err := idx.saveFileDataBuffered(ctx, buf, fd, chunks, chunkIDs); err != nil {
 				return filesIndexed, chunksCreated, err
 			}
 			filesIndexed++
 			chunksCreated += len(chunks)
 		}
+	}
+
+	if err := buf.flush(ctx); err != nil {
+		return filesIndexed, chunksCreated, err
 	}
 
 	return filesIndexed, chunksCreated, nil

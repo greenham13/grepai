@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1342,4 +1343,94 @@ func TestIndexFile_UsesTransformedContentAndStoresSourceSnippet(t *testing.T) {
 	if chunks[0].StartLine != 2 {
 		t.Fatalf("expected remapped start line 2, got %d", chunks[0].StartLine)
 	}
+}
+
+// countingStore records how many SaveChunks calls the batched indexer makes
+// and how many chunks each carried.
+type countingStore struct {
+	*mockStore
+	saveCalls  int
+	batchSizes []int
+}
+
+func (c *countingStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	c.saveCalls++
+	c.batchSizes = append(c.batchSizes, len(chunks))
+	return c.mockStore.SaveChunks(ctx, chunks)
+}
+
+func TestIndexFilesBatched_WritesChunksInCrossFileBatches(t *testing.T) {
+	root := t.TempDir()
+	// 120 files, each producing several chunks with a small chunker, so the
+	// total comfortably exceeds one store batch.
+	const fileCount = 120
+	var files []FileInfo
+	for i := 0; i < fileCount; i++ {
+		var b strings.Builder
+		for l := 0; l < 60; l++ {
+			fmt.Fprintf(&b, "func f%d_%d() { return %d }\n", i, l, l)
+		}
+		name := fmt.Sprintf("file%02d.go", i)
+		if err := os.WriteFile(filepath.Join(root, name), []byte(b.String()), 0644); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, FileInfo{Path: name, Content: b.String(), Hash: fmt.Sprintf("hash%d", i), ModTime: int64(1000 + i)})
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := &countingStore{mockStore: newMockStore()}
+	idx := NewIndexer(root, backing, newMockEmbedder(), NewChunker(128, 10), NewScanner(root, ignore), time.Time{})
+
+	indexed, chunks, err := idx.indexFilesBatched(context.Background(), files, newMockBatchEmbedder(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexed != fileCount {
+		t.Fatalf("filesIndexed = %d, want %d", indexed, fileCount)
+	}
+	if chunks <= storeChunkFlushSize {
+		t.Fatalf("test needs more than %d chunks to exercise flushing, got %d", storeChunkFlushSize, chunks)
+	}
+	if len(backing.chunks) != chunks {
+		t.Fatalf("store holds %d chunks, indexer reported %d", len(backing.chunks), chunks)
+	}
+	if len(backing.documents) != fileCount {
+		t.Fatalf("store holds %d documents, want %d", len(backing.documents), fileCount)
+	}
+	wantCalls := (chunks + storeChunkFlushSize - 1) / storeChunkFlushSize
+	if backing.saveCalls > wantCalls+1 || backing.saveCalls < wantCalls {
+		t.Fatalf("SaveChunks calls = %d (sizes %v), want about %d for %d chunks", backing.saveCalls, backing.batchSizes, wantCalls, chunks)
+	}
+	if backing.saveCalls >= fileCount {
+		t.Fatalf("SaveChunks called %d times for %d files: chunks are still written per file", backing.saveCalls, fileCount)
+	}
+	for i, size := range backing.batchSizes[:len(backing.batchSizes)-1] {
+		if size < storeChunkFlushSize {
+			t.Fatalf("non-final batch %d had %d chunks, want >= %d", i, size, storeChunkFlushSize)
+		}
+	}
+}
+
+func TestChunkWriteBuffer_FlushErrorSurfaces(t *testing.T) {
+	buf := &chunkWriteBuffer{store: &failingSaveStore{mockStore: newMockStore()}}
+	chunks := make([]store.Chunk, storeChunkFlushSize)
+	for i := range chunks {
+		chunks[i] = store.Chunk{ID: fmt.Sprintf("c%d", i)}
+	}
+	if err := buf.add(context.Background(), chunks, store.Document{Path: "x"}); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected the store error, got %v", err)
+	}
+	// Nothing pending: an explicit flush of an empty buffer is a no-op.
+	empty := &chunkWriteBuffer{store: &failingSaveStore{mockStore: newMockStore()}}
+	if err := empty.flush(context.Background()); err != nil {
+		t.Fatalf("empty flush returned %v", err)
+	}
+}
+
+type failingSaveStore struct{ *mockStore }
+
+func (f *failingSaveStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	return fmt.Errorf("disk full")
 }
