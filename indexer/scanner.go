@@ -100,23 +100,26 @@ var SupportedExtensions = map[string]bool{
 }
 
 type FileInfo struct {
-	Path    string
-	Size    int64
-	ModTime int64
-	Hash    string
-	Content string
+	Path        string
+	Size        int64
+	ModTime     int64
+	ModTimeNano int64
+	Hash        string
+	Content     string
 }
 
 type FileMeta struct {
-	Path    string
-	Size    int64
-	ModTime int64
+	Path        string
+	Size        int64
+	ModTime     int64
+	ModTimeNano int64
 }
 
 type Scanner struct {
 	root      string
 	ignore    *IgnoreMatcher
 	extraExts map[string]bool
+	readFile  func(string) ([]byte, error) // Optional reader override for focused I/O tests.
 }
 
 func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
@@ -204,9 +207,10 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 		}
 
 		files = append(files, FileMeta{
-			Path:    relPath,
-			Size:    info.Size(),
-			ModTime: info.ModTime().Unix(),
+			Path:        relPath,
+			Size:        info.Size(),
+			ModTime:     info.ModTime().Unix(),
+			ModTimeNano: info.ModTime().UnixNano(),
 		})
 
 		return nil
@@ -280,11 +284,12 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 		hash := sha256.Sum256(content)
 
 		files = append(files, FileInfo{
-			Path:    relPath,
-			Size:    info.Size(),
-			ModTime: info.ModTime().Unix(),
-			Hash:    hex.EncodeToString(hash[:]),
-			Content: string(content),
+			Path:        relPath,
+			Size:        info.Size(),
+			ModTime:     info.ModTime().Unix(),
+			ModTimeNano: info.ModTime().UnixNano(),
+			Hash:        hex.EncodeToString(hash[:]),
+			Content:     string(content),
 		})
 
 		return nil
@@ -310,7 +315,11 @@ func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
 		return nil, nil // Skip large files
 	}
 
-	content, err := os.ReadFile(absPath)
+	readFile := s.readFile
+	if readFile == nil {
+		readFile = os.ReadFile
+	}
+	content, err := readFile(absPath)
 	if err != nil {
 		return nil, err
 	}
@@ -322,11 +331,12 @@ func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
 	hash := sha256.Sum256(content)
 
 	return &FileInfo{
-		Path:    relPath,
-		Size:    info.Size(),
-		ModTime: info.ModTime().Unix(),
-		Hash:    hex.EncodeToString(hash[:]),
-		Content: string(content),
+		Path:        relPath,
+		Size:        info.Size(),
+		ModTime:     info.ModTime().Unix(),
+		ModTimeNano: info.ModTime().UnixNano(),
+		Hash:        hex.EncodeToString(hash[:]),
+		Content:     string(content),
 	}, nil
 }
 

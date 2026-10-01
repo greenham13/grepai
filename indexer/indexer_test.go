@@ -30,6 +30,7 @@ type mockStore struct {
 	listFilesStats   []store.FileStats
 	listDocsCalled   bool
 	getDocCalled     bool
+	getDocCalls      int
 	saveDocCalled    bool
 	saveChunksCalled bool
 	delByFileCalled  bool
@@ -95,6 +96,7 @@ func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Do
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getDocCalled = true
+	m.getDocCalls++
 	doc, ok := m.documents[filePath]
 	if !ok {
 		return nil, nil

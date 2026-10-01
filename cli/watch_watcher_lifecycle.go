@@ -193,6 +193,9 @@ func persistWorkspaceStores(ctx context.Context, st store.VectorStore, runtimes 
 		errs = append(errs, fmt.Errorf("persist workspace vector index: %w", err))
 	}
 	for _, runtime := range runtimes {
+		if err := runtime.idx.PersistScanSnapshot(ctx, true); err != nil {
+			errs = append(errs, fmt.Errorf("persist scan snapshot for %s: %w", runtime.project.Name, err))
+		}
 		if err := runtime.symbolStore.Persist(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("persist symbol index for %s: %w", runtime.project.Name, err))
 		}

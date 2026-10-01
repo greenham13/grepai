@@ -703,6 +703,7 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.
 
 	// persistAndExit persists all stores before returning from the event loop.
 	persistAndExit := func() error {
+		persistScanSnapshot(ctx, idx, true)
 		if err := st.Persist(ctx); err != nil {
 			log.Printf("Warning: failed to persist index on shutdown: %v", err)
 		}
@@ -728,6 +729,7 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.
 			return persistAndExit()
 
 		case <-persistTicker.C:
+			persistScanSnapshot(ctx, idx, true)
 			if err := st.Persist(ctx); err != nil {
 				log.Printf("Warning: failed to persist index: %v", err)
 			}
@@ -1339,6 +1341,7 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 	persistAndShutdown := func() {
 		mutationFence.cleanup(ctx, func() {
 			<-rpgWorker.done
+			persistScanSnapshot(ctx, idx, true)
 			if err := st.Persist(ctx); err != nil {
 				log.Printf("Warning: failed to persist index on shutdown for %s: %v", projectRoot, err)
 			}
@@ -1364,7 +1367,7 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 			return nil
 
 		case <-persistTicker.C:
-			if err := persistProjectPeriodically(ctx, mutationFence, st, symbolStore, rpgStore, projectRoot); err != nil {
+			if err := persistProjectPeriodically(ctx, mutationFence, st, symbolStore, rpgStore, projectRoot, idx); err != nil {
 				if ctx.Err() != nil {
 					persistAndShutdown()
 					return nil
@@ -2309,6 +2312,7 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 }
 
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
+	defer persistScanSnapshot(ctx, idx, false)
 	// An atomic write -- write to a temp file, then rename it over the target
 	// -- surfaces on the destination path as RENAME/REMOVE with no follow-up
 	// CREATE or WRITE. Editors and coding agents (Claude Code, Cursor) save
@@ -2362,7 +2366,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			return // File was skipped (binary, too large, etc.)
 		}
 
-		needsReindex, err := idx.NeedsReindex(ctx, fileInfo.Path, fileInfo.Hash)
+		needsReindex, err := idx.FileNeedsReindex(ctx, *fileInfo)
 		if err != nil {
 			log.Printf("Failed to check reindex status for %s: %v", event.Path, err)
 			return

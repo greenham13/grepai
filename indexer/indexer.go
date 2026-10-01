@@ -23,6 +23,7 @@ type Indexer struct {
 	scanner       *Scanner
 	processor     *framework.ProcessorRegistry
 	lastIndexTime time.Time
+	snapshot      *scanSnapshot
 }
 
 type IndexStats struct {
@@ -80,6 +81,7 @@ func NewIndexer(
 		scanner:       scanner,
 		processor:     processor,
 		lastIndexTime: lastIndexTime,
+		snapshot:      loadScanSnapshot(root),
 	}
 }
 
@@ -117,6 +119,8 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	for _, doc := range existingDocs {
 		existingMap[doc] = true
 	}
+
+	idx.snapshot.reconcile(existingMap)
 
 	// Every scanned file is accounted for exactly once: it either still exists
 	// (and is removed from existingMap below) or it was deleted from disk and
@@ -220,6 +224,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		stats.FilesRemoved++
 	}
 
+	if err := idx.PersistScanSnapshot(ctx, true); err != nil {
+		log.Printf("Warning: %v", err)
+	}
 	stats.Duration = time.Since(start)
 	return stats, nil
 }
@@ -240,8 +247,13 @@ type fileScanDecision struct {
 // whether it needs (re)indexing, following the same rules as the original
 // sequential loop: an mtime fast-path gate, then a content-hash comparison
 // for files that need a closer look. It is safe to call concurrently for
-// different files -- it only reads from the store and the filesystem.
+// different files -- snapshot updates are synchronized.
 func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (fileScanDecision, error) {
+	entry, hadSnapshot := idx.snapshot.get(fileMeta.Path)
+	if hadSnapshot && entry.ModTime == fileMeta.ModTimeNano && entry.Size == fileMeta.Size && entry.Chunks > 0 {
+		return fileScanDecision{countAsSkipped: true}, nil
+	}
+
 	// Fetch the document once -- used by both the mod-time gate and hash check.
 	doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
 	if err != nil {
@@ -251,9 +263,12 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 	// Skip files modified before lastIndexTime -- but only if they have chunks.
 	// Files with no chunks need re-indexing even if their mod_time is old
 	// (e.g., a prior indexing run created the document but failed to embed).
-	if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
+	// A snapshot mismatch is evidence of a change, even when its mtime is
+	// older than the cutoff (for example a checkout restoring timestamps).
+	if !hadSnapshot && !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
 		fileModTime := time.Unix(fileMeta.ModTime, 0)
 		if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
+			idx.snapshot.record(FileInfo{Path: fileMeta.Path, ModTimeNano: fileMeta.ModTimeNano, Size: fileMeta.Size, Hash: doc.Hash}, len(doc.ChunkIDs))
 			return fileScanDecision{countAsSkipped: true}, nil
 		}
 	}
@@ -269,6 +284,7 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 	}
 
 	if doc != nil && doc.Hash == file.Hash && len(doc.ChunkIDs) > 0 {
+		idx.snapshot.record(*file, len(doc.ChunkIDs))
 		return fileScanDecision{}, nil // File unchanged and has chunks
 	}
 
@@ -330,6 +346,7 @@ func (idx *Indexer) prepareFileChunks(
 	for i := range files {
 		file := files[i]
 		g.Go(func() error {
+			idx.snapshot.remove(file.Path)
 			if err := idx.store.DeleteByFile(gctx, file.Path); err != nil {
 				return fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
 			}
@@ -422,6 +439,7 @@ func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks [
 		return fmt.Errorf("failed to save document for %s: %w", fd.file.Path, err)
 	}
 
+	idx.snapshot.record(fd.file, len(chunkIDs))
 	return nil
 }
 
@@ -441,6 +459,7 @@ type chunkWriteBuffer struct {
 	store        store.VectorStore
 	pendingChunk []store.Chunk
 	pendingDocs  []store.Document
+	onSaved      func(store.Document)
 }
 
 func (b *chunkWriteBuffer) add(ctx context.Context, chunks []store.Chunk, doc store.Document) error {
@@ -464,6 +483,9 @@ func (b *chunkWriteBuffer) flush(ctx context.Context) error {
 	for _, doc := range b.pendingDocs {
 		if err := b.store.SaveDocument(ctx, doc); err != nil {
 			return fmt.Errorf("failed to save document for %s: %w", doc.Path, err)
+		}
+		if b.onSaved != nil {
+			b.onSaved(doc)
 		}
 	}
 	b.pendingChunk = b.pendingChunk[:0]
@@ -579,7 +601,13 @@ func (idx *Indexer) indexFilesBatched(
 
 	// Save fully-cached files immediately
 	now := time.Now()
-	buf := &chunkWriteBuffer{store: idx.store}
+	filesByPath := make(map[string]FileInfo, len(files))
+	for _, file := range files {
+		filesByPath[file.Path] = file
+	}
+	buf := &chunkWriteBuffer{store: idx.store, onSaved: func(doc store.Document) {
+		idx.snapshot.record(filesByPath[doc.Path], len(doc.ChunkIDs))
+	}}
 	for _, pf := range preFilledFiles {
 		fd := fileData[pf.fdIndex]
 		idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
@@ -631,6 +659,8 @@ const maxReChunkAttempts = 3
 
 // IndexFile indexes a single file
 func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
+	// Invalidate before deleting chunks, including failed re-index attempts.
+	idx.snapshot.remove(file.Path)
 	// Remove existing chunks for this file
 	if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
 		return 0, fmt.Errorf("failed to delete existing chunks: %w", err)
@@ -737,6 +767,7 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 		return 0, fmt.Errorf("failed to save document: %w", err)
 	}
 
+	idx.snapshot.record(file, len(chunkIDs))
 	return len(chunks), nil
 }
 
@@ -874,6 +905,7 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 
 // RemoveFile removes a file from the index
 func (idx *Indexer) RemoveFile(ctx context.Context, path string) error {
+	idx.snapshot.remove(path)
 	if err := idx.store.DeleteByFile(ctx, path); err != nil {
 		return fmt.Errorf("failed to delete chunks: %w", err)
 	}
@@ -887,6 +919,15 @@ func (idx *Indexer) RemoveFile(ctx context.Context, path string) error {
 
 // NeedsReindex checks if a file needs reindexing
 func (idx *Indexer) NeedsReindex(ctx context.Context, path string, hash string) (bool, error) {
+	return idx.needsReindex(ctx, path, hash, nil)
+}
+
+// FileNeedsReindex also records verified unchanged content in the scan snapshot.
+func (idx *Indexer) FileNeedsReindex(ctx context.Context, file FileInfo) (bool, error) {
+	return idx.needsReindex(ctx, file.Path, file.Hash, &file)
+}
+
+func (idx *Indexer) needsReindex(ctx context.Context, path string, hash string, file *FileInfo) (bool, error) {
 	doc, err := idx.store.GetDocument(ctx, path)
 	if err != nil {
 		return false, err
@@ -901,5 +942,8 @@ func (idx *Indexer) NeedsReindex(ctx context.Context, path string, hash string) 
 		return true, nil
 	}
 
+	if file != nil {
+		idx.snapshot.record(*file, len(doc.ChunkIDs))
+	}
 	return false, nil
 }

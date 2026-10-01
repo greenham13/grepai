@@ -72,6 +72,33 @@ func TestIndexAllWithProgress_BranchSwitchSkipsBulkWithoutLookupOrEmbedding(t *t
 	}
 }
 
+func TestIndexAllWithProgress_BranchSwitchInvalidatesSnapshot(t *testing.T) {
+	idx, st, reads := snapshotFixture(t)
+	path := "file_0000.go"
+	before, _ := idx.snapshot.get(path)
+	if err := os.WriteFile(filepath.Join(idx.root, path), []byte("package alternate\nfunc branch() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	checkoutTime := time.Unix(0, before.ModTime).Add(time.Second)
+	if err := os.Chtimes(filepath.Join(idx.root, path), checkoutTime, checkoutTime); err != nil {
+		t.Fatal(err)
+	}
+	idx = NewIndexer(idx.root, st, newMockEmbedder(), idx.chunker, idx.scanner, time.Unix(0, before.ModTime))
+	reads.Store(0)
+	st.getDocCalls = 0
+	stats, err := idx.IndexAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesIndexed != 1 || reads.Load() != 1 || st.getDocCalls != 1 {
+		t.Fatalf("lookups=%d reads=%d stats=%+v", st.getDocCalls, reads.Load(), stats)
+	}
+	after, _ := idx.snapshot.get(path)
+	if after.Hash == before.Hash || after.ModTime != checkoutTime.UnixNano() {
+		t.Fatalf("snapshot not updated: %+v", after)
+	}
+}
+
 func BenchmarkIndexAllWithProgress_BranchSwitchScenario(b *testing.B) {
 	ctx := context.Background()
 	tmpDir := b.TempDir()
@@ -158,13 +185,15 @@ func BenchmarkIndexAllWithProgress_FullHashRescan(b *testing.B) {
 
 	mockEmbedder := newMockEmbedder()
 	// lastIndexTime is intentionally zero so the mtime fast-path gate never
-	// applies -- every file must go through ScanFile + hash comparison.
+	// applies. Clear the snapshot each iteration as well, so this benchmark
+	// continues to measure ScanFile + hash comparison rather than cache hits.
 	idx := NewIndexer(tmpDir, mockStore, mockEmbedder, chunker, scanner, time.Time{})
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
+		idx.snapshot.entries = make(map[string]scanSnapshotEntry)
 		stats, err := idx.IndexAllWithProgress(ctx, nil)
 		if err != nil {
 			b.Fatalf("IndexAllWithProgress failed: %v", err)
