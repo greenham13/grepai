@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -99,7 +100,7 @@ func TestRelativePathFailurePublishesFatal(t *testing.T) {
 	_ = w.Close()
 }
 
-func TestFullEventQueuePublishesFatalAndStops(t *testing.T) {
+func TestFullEventQueueAppliesBackpressure(t *testing.T) {
 	root := t.TempDir()
 	w := newTestWatcher(t, root)
 	if err := w.Start(context.Background()); err != nil {
@@ -112,13 +113,24 @@ func TestFullEventQueuePublishesFatalAndStops(t *testing.T) {
 		w.pending[path] = FileEvent{Type: EventModify, Path: path}
 	}
 	w.pendingMu.Unlock()
-	w.flush()
-	err := <-w.Errors()
-	var fatalErr *FatalError
-	if !errors.As(err, &fatalErr) || fatalErr.Operation != "enqueue file event" {
-		t.Fatalf("Errors() = %T %v, want enqueue FatalError", err, err)
+	total := len(w.pending)
+	flushed := make(chan struct{})
+	go func() { w.flush(); close(flushed) }()
+	select {
+	case <-flushed:
+		t.Fatal("flush returned while the queue was full; want it to wait")
+	case err := <-w.Errors():
+		t.Fatalf("full queue must not be fatal, got %v", err)
+	case <-time.After(100 * time.Millisecond):
 	}
-	<-w.processingDone
+	for i := 0; i < total; i++ {
+		select {
+		case <-w.Events():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only received %d of %d events", i, total)
+		}
+	}
+	<-flushed
 }
 
 func TestUnexpectedBackendChannelClosureIsFatal(t *testing.T) {

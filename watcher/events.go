@@ -145,9 +145,6 @@ func (w *Watcher) flush() {
 		case <-w.done:
 			return
 		case w.events <- event:
-		default:
-			w.publishFatal(&FatalError{Operation: "enqueue file event", Path: event.Path, Cause: errEventQueueFull})
-			return
 		}
 	}
 }
