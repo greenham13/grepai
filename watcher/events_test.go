@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -101,36 +102,54 @@ func TestRelativePathFailurePublishesFatal(t *testing.T) {
 }
 
 func TestFullEventQueueAppliesBackpressure(t *testing.T) {
-	root := t.TempDir()
-	w := newTestWatcher(t, root)
-	if err := w.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	defer w.Close()
-	w.pendingMu.Lock()
-	for i := 0; i <= cap(w.events); i++ {
-		path := filepath.Join(root, string(rune('a'+i)))
-		w.pending[path] = FileEvent{Type: EventModify, Path: path}
-	}
-	w.pendingMu.Unlock()
-	total := len(w.pending)
-	flushed := make(chan struct{})
-	go func() { w.flush(); close(flushed) }()
-	select {
-	case <-flushed:
-		t.Fatal("flush returned while the queue was full; want it to wait")
-	case err := <-w.Errors():
-		t.Fatalf("full queue must not be fatal, got %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	for i := 0; i < total; i++ {
-		select {
-		case <-w.Events():
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only received %d of %d events", i, total)
+	synctest.Test(t, func(t *testing.T) {
+		w := &Watcher{
+			events:  make(chan FileEvent, 100),
+			errors:  make(chan error, 1),
+			done:    make(chan struct{}),
+			pending: make(map[string]FileEvent),
 		}
-	}
-	<-flushed
+		defer w.Abort()
+		for i := 0; i <= cap(w.events); i++ {
+			path := string(rune('a' + i))
+			w.pending[path] = FileEvent{Type: EventModify, Path: path}
+		}
+		total := len(w.pending)
+		flushed := make(chan struct{})
+		go func() { w.flush(); close(flushed) }()
+		synctest.Wait()
+		if got := len(w.events); got != cap(w.events) {
+			t.Fatalf("queue holds %d events, want %d", got, cap(w.events))
+		}
+		select {
+		case <-flushed:
+			t.Fatal("flush returned while the queue was full; want it to wait")
+		case err := <-w.Errors():
+			t.Fatalf("full queue must not be fatal, got %v", err)
+		default:
+		}
+		deadline := time.NewTimer(2 * time.Second)
+		defer deadline.Stop()
+		for i := 0; i < total; i++ {
+			select {
+			case <-w.Events():
+			case err := <-w.Errors():
+				t.Fatalf("full queue must not be fatal, got %v", err)
+			case <-deadline.C:
+				t.Fatalf("only received %d of %d events", i, total)
+			}
+		}
+		select {
+		case <-flushed:
+		case <-deadline.C:
+			t.Fatal("flush did not finish after the queue was drained")
+		}
+		select {
+		case err := <-w.Errors():
+			t.Fatalf("full queue must not be fatal, got %v", err)
+		default:
+		}
+	})
 }
 
 func TestUnexpectedBackendChannelClosureIsFatal(t *testing.T) {
