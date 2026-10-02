@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -157,11 +158,26 @@ func (s *Scanner) isSupported(ext string) bool {
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
 func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
+	return s.scanMetadata(context.Background(), false)
+}
+
+// ScanMetadataContext rejects partial walks so they cannot authorize a git skip.
+func (s *Scanner) ScanMetadataContext(ctx context.Context) ([]FileMeta, []string, error) {
+	return s.scanMetadata(ctx, true)
+}
+
+func (s *Scanner) scanMetadata(ctx context.Context, strict bool) ([]FileMeta, []string, error) {
 	var files []FileMeta
 	var skipped []string
 
 	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
+			if strict {
+				return err
+			}
 			return nil // Skip files we can't access
 		}
 
@@ -197,6 +213,9 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 
 		info, err := d.Info()
 		if err != nil {
+			if strict {
+				return err
+			}
 			return nil
 		}
 

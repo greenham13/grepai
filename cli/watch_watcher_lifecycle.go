@@ -119,19 +119,17 @@ func monitorWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRunti
 
 type workspaceRuntimeInitializer func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, *watcher.Backend, bool) (*workspaceProjectRuntime, watchSource, error)
 
-// initializeWorkspaceRuntimes indexes every project and attaches live file
-// watching where the OS lets it. A project whose watch registration fails
-// (inotify limits, unreadable directories) keeps its runtime and is indexed
-// on every watcher start, without live updates in between; one project can
-// no longer take the whole workspace down.
+// initializeWorkspaceRuntimes attaches live file watching where the OS lets it.
+// Reconciliation is queued only after all runtimes have started. A project whose
+// registration fails keeps its runtime for paced scans without live updates.
 func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb embedder.Embedder, sharedStore store.VectorStore, backend *watcher.Backend, isBackgroundChild bool, initialize workspaceRuntimeInitializer) (map[string]*workspaceProjectRuntime, []watchSource, error) {
 	runtimes := make(map[string]*workspaceProjectRuntime, len(ws.Projects))
 	watchers := make([]watchSource, 0, len(ws.Projects))
 	for _, project := range ws.Projects {
 		if !isBackgroundChild {
-			fmt.Printf("\nIndexing project: %s (%s)\n", project.Name, project.Path)
+			fmt.Printf("\nStarting project watch: %s (%s)\n", project.Name, project.Path)
 		} else {
-			log.Printf("Indexing project: %s (%s)", project.Name, project.Path)
+			log.Printf("Starting project watch: %s (%s)", project.Name, project.Path)
 		}
 		runtime, w, err := initialize(ctx, ws, project, emb, sharedStore, backend, isBackgroundChild)
 		if err != nil {
@@ -139,7 +137,7 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 				log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
 				continue
 			}
-			log.Printf("Warning: live file watching is off for project %s (%s): %v. Its index still updates on every watcher start.", project.Name, project.Path, err)
+			log.Printf("Warning: live file watching is off for project %s (%s): %v. Its index will update through paced reconciliation.", project.Name, project.Path, err)
 			runtime.watcher = nil
 			runtimes[canonicalPath(project.Path)] = runtime
 			continue

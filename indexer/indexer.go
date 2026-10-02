@@ -16,14 +16,16 @@ import (
 )
 
 type Indexer struct {
-	root          string
-	store         store.VectorStore
-	embedder      embedder.Embedder
-	chunker       *Chunker
-	scanner       *Scanner
-	processor     *framework.ProcessorRegistry
-	lastIndexTime time.Time
-	snapshot      *scanSnapshot
+	root           string
+	store          store.VectorStore
+	embedder       embedder.Embedder
+	chunker        *Chunker
+	scanner        *Scanner
+	processor      *framework.ProcessorRegistry
+	lastIndexTime  time.Time
+	snapshot       *scanSnapshot
+	reconcileScope string
+	scanMetadata   func(context.Context) ([]FileMeta, []string, error)
 }
 
 type IndexStats struct {
@@ -82,6 +84,7 @@ func NewIndexer(
 		processor:     processor,
 		lastIndexTime: lastIndexTime,
 		snapshot:      loadScanSnapshot(root),
+		scanMetadata:  scanner.ScanMetadataContext,
 	}
 }
 
@@ -249,6 +252,10 @@ type fileScanDecision struct {
 // for files that need a closer look. It is safe to call concurrently for
 // different files -- snapshot updates are synchronized.
 func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (fileScanDecision, error) {
+	return idx.decideFileScanChecked(ctx, fileMeta, false)
+}
+
+func (idx *Indexer) decideFileScanChecked(ctx context.Context, fileMeta FileMeta, strict bool) (fileScanDecision, error) {
 	entry, hadSnapshot := idx.snapshot.get(fileMeta.Path)
 	if hadSnapshot && entry.ModTime == fileMeta.ModTimeNano && entry.Size == fileMeta.Size && entry.Chunks > 0 {
 		return fileScanDecision{countAsSkipped: true}, nil
@@ -276,6 +283,9 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 	// Load file content and hash only after metadata filtering.
 	file, err := idx.scanner.ScanFile(fileMeta.Path)
 	if err != nil {
+		if strict {
+			return fileScanDecision{}, err
+		}
 		log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
 		return fileScanDecision{countAsSkipped: true}, nil
 	}

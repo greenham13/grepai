@@ -3,7 +3,9 @@ package indexer
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -30,6 +32,7 @@ type scanSnapshot struct {
 	entries  map[string]scanSnapshotEntry
 	dirty    bool
 	lastSave time.Time
+	gitState GitScanState
 }
 
 func loadScanSnapshot(root string) *scanSnapshot {
@@ -41,12 +44,17 @@ func loadScanSnapshot(root string) *scanSnapshot {
 	}
 	defer f.Close()
 	var entries map[string]scanSnapshotEntry
-	if err := gob.NewDecoder(f).Decode(&entries); err != nil {
+	decoder := gob.NewDecoder(f)
+	if err := decoder.Decode(&entries); err != nil {
 		log.Printf("Ignoring corrupt scan snapshot %s: %v", s.path, err)
 		return s
 	}
 	if entries != nil {
 		s.entries = entries
+	}
+	if err := decoder.Decode(&s.gitState); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("Ignoring git scan state %s: %v", s.path, err)
+		s.gitState = GitScanState{}
 	}
 	return s
 }
@@ -69,6 +77,7 @@ func (s *scanSnapshot) record(file FileInfo, chunks int) {
 	defer s.mu.Unlock()
 	entry := scanSnapshotEntry{ModTime: file.ModTimeNano, Size: file.Size, Hash: file.Hash, Chunks: chunks}
 	if old, ok := s.entries[file.Path]; !ok || old != entry {
+		s.gitState = GitScanState{}
 		s.entries[file.Path] = entry
 		s.dirty = true
 	}
@@ -81,6 +90,7 @@ func (s *scanSnapshot) remove(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.entries[path]; ok {
+		s.gitState = GitScanState{}
 		delete(s.entries, path)
 		s.dirty = true
 	}
@@ -95,6 +105,7 @@ func (s *scanSnapshot) reconcile(documents map[string]bool) {
 	}
 	for path := range s.entries {
 		if !documents[path] {
+			s.gitState = GitScanState{}
 			delete(s.entries, path)
 			s.dirty = true
 		}
@@ -123,7 +134,12 @@ func (s *scanSnapshot) save(force bool, beforeSave ...func() error) error {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if err := gob.NewEncoder(f).Encode(s.entries); err != nil {
+	encoder := gob.NewEncoder(f)
+	if err := encoder.Encode(s.entries); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := encoder.Encode(s.gitState); err != nil {
 		_ = f.Close()
 		return err
 	}

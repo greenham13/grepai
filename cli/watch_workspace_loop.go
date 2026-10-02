@@ -24,6 +24,7 @@ type workspaceWatchLoop struct {
 	// staleRescanEvery: every this many persist ticks, projects without a
 	// live watcher are rescanned so they do not stay stale until the next
 	// watcher start. 0 disables (tests).
+	reconcileStale    chan<- struct{}
 	staleRescanEvery  int
 	persistTickCount  int
 	stopForwarders    func()
@@ -118,6 +119,13 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 			}
 			l.persistTickCount++
 			if l.staleRescanEvery > 0 && l.persistTickCount%l.staleRescanEvery == 0 {
+				if l.reconcileStale != nil {
+					select {
+					case l.reconcileStale <- struct{}{}:
+					default:
+					}
+					continue
+				}
 				if err := rescanProjectsWithoutLiveWatch(l.ctx, l.fence, l.runtimes); err != nil {
 					if l.ctx.Err() != nil {
 						return l.gracefulShutdown("")

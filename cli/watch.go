@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2875,8 +2877,44 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		}
 	}()
 
-	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, backend, isBackgroundChild, initializeWorkspaceRuntime)
+	workerCtx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
+	workers := make([]watchMutationWorker, 0, len(ws.Projects)*2+1)
+	fatalChan := make(chan error, 1)
+	withdrawReadiness := func() {
+		if isBackgroundChild {
+			if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
+				log.Printf("Warning: failed to withdraw workspace ready marker: %v", err)
+			}
+		}
+	}
+	// Start each project's event writer before registering the next project.
+	// No scan, git probe, or RPG rebuild is on this startup path.
+	initialize := func(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, st store.VectorStore, backend *watcher.Backend, background bool) (*workspaceProjectRuntime, watchSource, error) {
+		runtime, w, err := initializeWorkspaceRuntime(ctx, ws, project, emb, st, backend, background)
+		if runtime == nil {
+			return runtime, w, err
+		}
+		if w != nil {
+			if !mutationFence.addWatcher(w) {
+				_ = w.Close()
+				return runtime, nil, errWatchMutationAdmissionClosed
+			}
+			go monitorWorkspaceWatcher(workerCtx, runtime, mutationFence, func() { _ = backend.Close() }, withdrawReadiness, fatalChan)
+		}
+		watchCfg := runtime.cfg.Watch
+		writer := startWorkspaceProjectWriter(workerCtx, mutationFence, runtime)
+		workers = append(workers, writer)
+		<-writer.started
+		workers = append(workers, startRPGRealtimeWorkers(workerCtx, mutationFence, fmt.Sprintf("workspace:%s/%s", ws.Name, project.Name), runtime.symbolStore, runtime.rpgEncoder, runtime.rpgStore, watchCfg, runtime.manager))
+		return runtime, w, err
+	}
+	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, backend, isBackgroundChild, initialize)
 	if err != nil {
+		stopWorkers()
+		for _, worker := range workers {
+			<-worker.done
+		}
 		abortStores = isFatalWatcherError(err)
 		return err
 	}
@@ -2894,45 +2932,19 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		})
 	}()
 
-	// Collect events from all watchers
-	eventChan := make(chan workspaceWatchEvent, 100)
-	fatalChan := make(chan error, 1)
-	forwardCtx, stopForwarders := context.WithCancel(ctx)
-	defer stopForwarders()
-	for _, w := range watchers {
-		if !mutationFence.addWatcher(w) {
-			abortStores = true
-			abortWatcherClose = true
-			abortWatchSources(watchers)
-			return errWatchMutationAdmissionClosed
+	defer func() {
+		stopWorkers()
+		for _, worker := range workers {
+			<-worker.done
 		}
+	}()
+	for _, w := range watchers {
 		defer mutationFence.removeWatcher(w)
-	}
-	workerCtx, stopWorkers := context.WithCancel(ctx)
-	defer stopWorkers()
-	workers := make([]watchMutationWorker, 0, len(runtimes))
-	for _, runtime := range runtimes {
-		worker := startRPGRealtimeWorkers(workerCtx, mutationFence, fmt.Sprintf("workspace:%s/%s", ws.Name, runtime.project.Name), runtime.symbolStore, runtime.rpgEncoder, runtime.rpgStore, runtime.cfg.Watch, runtime.manager)
-		workers = append(workers, worker)
 	}
 	for _, worker := range workers {
 		<-worker.started
 	}
-	withdrawReadiness := func() {
-		if isBackgroundChild {
-			if removeErr := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); removeErr != nil {
-				log.Printf("Warning: failed to withdraw workspace ready marker: %v", removeErr)
-			}
-		}
-	}
-	for _, runtime := range runtimes {
-		runtime := runtime
-		if runtime.watcher == nil {
-			continue
-		}
-		go forwardWorkspaceWatcher(forwardCtx, runtime, eventChan)
-		go monitorWorkspaceWatcher(forwardCtx, runtime, mutationFence, func() { abortWatchSources(watchers) }, withdrawReadiness, fatalChan)
-	}
+	stopForwarders := func() {} // Project writers own live event intake.
 
 	// Publish readiness only while every watcher excludes fatal publication.
 	if isBackgroundChild {
@@ -2975,6 +2987,8 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		log.Printf("Watching %d projects for changes...%s", len(runtimes), staleNote)
 	}
 
+	staleRequests := make(chan struct{}, 1)
+	workers = append(workers, startWorkspaceReconciliation(workerCtx, mutationFence, st, runtimes, staleRequests))
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
 	err = runWorkspaceWatchLoop(&workspaceWatchLoop{
@@ -2983,12 +2997,12 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		runtimes:          runtimes,
 		watchers:          watchers,
 		fence:             mutationFence,
-		events:            eventChan,
 		fatals:            fatalChan,
 		signals:           sigChan,
 		stops:             wsStopCh,
 		persistTicks:      persistTicker.C,
 		staleRescanEvery:  staleRescanEveryTicks,
+		reconcileStale:    staleRequests,
 		stopForwarders:    stopForwarders,
 		stopWorkers:       stopWorkers,
 		workers:           workers,
@@ -3024,20 +3038,23 @@ type workspaceWatchEvent struct {
 }
 
 type workspaceProjectRuntime struct {
-	project         config.ProjectEntry
-	cfg             *config.Config
-	idx             *indexer.Indexer
-	scanner         *indexer.Scanner
-	extractor       *trace.RegexExtractor
-	processor       *framework.ProcessorRegistry
-	symbolStore     *trace.GOBSymbolStore
-	rpgEncoder      *rpg.RPGEncoder
-	rpgStore        rpg.RPGStore
-	vectorStore     store.VectorStore
-	tracedLanguages []string
-	lastConfigWrite time.Time
-	manager         *rpgRealtimeManager
-	watcher         watchSource
+	project                config.ProjectEntry
+	cfg                    *config.Config
+	idx                    *indexer.Indexer
+	scanner                *indexer.Scanner
+	extractor              *trace.RegexExtractor
+	processor              *framework.ProcessorRegistry
+	symbolStore            *trace.GOBSymbolStore
+	rpgEncoder             *rpg.RPGEncoder
+	rpgStore               rpg.RPGStore
+	vectorStore            store.VectorStore
+	tracedLanguages        []string
+	lastConfigWrite        time.Time
+	manager                *rpgRealtimeManager
+	watcher                watchSource
+	reconcileOps           chan reconcileOperation
+	lastIndexTime          time.Time
+	auxiliaryIndexesLoaded bool
 }
 
 // initializeWorkspaceRuntime builds one project's indexer, symbol/RPG stores
@@ -3074,8 +3091,19 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	}
 	idx := indexer.NewIndexer(project.Path, vectorStore, emb, chunker, scanner, projectCfg.Watch.LastIndexTime, processorRegistry)
 	extractor := trace.NewRegexExtractor()
+	// An unchanged source tree must not hide changed chunking/trace rules.
+	receiptCfg := *projectCfg
+	receiptCfg.Watch.LastIndexTime = time.Time{}
+	receipt, err := json.Marshal([]any{"workspace-reconcile-v1", receiptCfg, ws.Embedder, ws.Chunking.CustomExtensions, extractor.Version()})
+	if err != nil {
+		return nil, nil, fmt.Errorf("scan rules: %w", err)
+	}
+	idx.SetReconciliationScope(fmt.Sprintf("%x", sha256.Sum256(receipt)))
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(project.Path))
+	_, symbolStatErr := os.Stat(config.GetSymbolIndexPath(project.Path))
+	auxiliaryIndexesLoaded := symbolStatErr == nil
 	if err := symbolStore.Load(ctx); err != nil {
+		auxiliaryIndexesLoaded = false
 		log.Printf("Warning: failed to load symbol index for %s: %v", project.Path, err)
 	}
 
@@ -3084,24 +3112,16 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		tracedLanguages = config.DefaultConfig().Trace.EnabledLanguages
 	}
 
-	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil, processorRegistry)
-	if err != nil {
-		_ = symbolStore.Close()
-		return nil, nil, err
-	}
-	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
-		projectCfg.Watch.LastIndexTime = time.Now()
-		if err := projectCfg.Save(project.Path); err != nil {
-			log.Printf("Warning: failed to save config for %s: %v", project.Name, err)
-		}
-	}
-
 	var rpgStore rpg.RPGStore
 	var rpgEncoder *rpg.RPGEncoder
 	var manager *rpgRealtimeManager
 	if projectCfg.RPG.Enabled {
 		rpgStore = rpg.NewGOBRPGStore(config.GetRPGIndexPath(project.Path))
+		if _, err := os.Stat(config.GetRPGIndexPath(project.Path)); err != nil {
+			auxiliaryIndexesLoaded = false
+		}
 		if err := rpgStore.Load(ctx); err != nil {
+			auxiliaryIndexesLoaded = false
 			log.Printf("Warning: failed to load RPG index for %s: %v", project.Path, err)
 		}
 
@@ -3129,29 +3149,25 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 			MaxTraversalDepth:    projectCfg.RPG.MaxTraversalDepth,
 			FeatureGroupStrategy: projectCfg.RPG.FeatureGroupStrategy,
 		})
-		if err := rpgEncoder.BuildFull(ctx, symbolStore, vectorStore, nil); err != nil {
-			log.Printf("Warning: failed to build RPG graph for %s: %v", project.Path, err)
-		}
-		if err := rpgStore.Persist(ctx); err != nil {
-			log.Printf("Warning: failed to persist RPG graph for %s: %v", project.Path, err)
-		}
 
 		manager = newRPGRealtimeManager(projectCfg.Watch.RPGMaxDirtyFilesPerBatch)
 	}
 
 	runtime := &workspaceProjectRuntime{
-		project:         project,
-		cfg:             projectCfg,
-		idx:             idx,
-		scanner:         scanner,
-		extractor:       extractor,
-		processor:       processorRegistry,
-		symbolStore:     symbolStore,
-		rpgEncoder:      rpgEncoder,
-		rpgStore:        rpgStore,
-		vectorStore:     vectorStore,
-		tracedLanguages: tracedLanguages,
-		manager:         manager,
+		project:                project,
+		cfg:                    projectCfg,
+		lastIndexTime:          projectCfg.Watch.LastIndexTime,
+		auxiliaryIndexesLoaded: auxiliaryIndexesLoaded,
+		idx:                    idx,
+		scanner:                scanner,
+		extractor:              extractor,
+		processor:              processorRegistry,
+		symbolStore:            symbolStore,
+		rpgEncoder:             rpgEncoder,
+		rpgStore:               rpgStore,
+		vectorStore:            vectorStore,
+		tracedLanguages:        tracedLanguages,
+		manager:                manager,
 	}
 
 	w := watcher.NewWatcherWithBackend(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs, backend)
@@ -3274,14 +3290,18 @@ func (p *projectPrefixStore) ListDocuments(ctx context.Context) ([]string, error
 	if err != nil {
 		return nil, err
 	}
+	return p.filterDocuments(all), nil
+}
+
+func (p *projectPrefixStore) filterDocuments(all []string) []string {
 	prefix := p.getPrefix() + "/"
-	out := make([]string, 0, len(all))
+	out := make([]string, 0)
 	for _, path := range all {
 		if strings.HasPrefix(path, prefix) {
 			out = append(out, strings.TrimPrefix(path, prefix))
 		}
 	}
-	return out, nil
+	return out
 }
 
 func (p *projectPrefixStore) Load(ctx context.Context) error {
