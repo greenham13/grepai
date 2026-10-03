@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/store"
 )
 
@@ -27,6 +28,18 @@ func runSnapshotGit(t *testing.T, root string, args ...string) string {
 
 func gitReconcileFixture(t *testing.T) (*Indexer, *mockStore, *atomic.Int64) {
 	t.Helper()
+	return gitReconcileFixtureFiles(t, map[string]string{
+		".gitignore": ".grepai/\n",
+		"main.go":    "package main\nfunc main() {}\n",
+		"other.go":   "package main\nfunc other() {}\n",
+	})
+}
+
+// gitReconcileFixtureFiles builds the reconcile fixture with an explicit
+// committed file set. Omitting ".gitignore" leaves grepai's own .grepai/
+// config dir untracked, which is the real-world state of indexed repos.
+func gitReconcileFixtureFiles(t *testing.T, files map[string]string) (*Indexer, *mockStore, *atomic.Int64) {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git is not installed")
 	}
@@ -34,7 +47,7 @@ func gitReconcileFixture(t *testing.T) (*Indexer, *mockStore, *atomic.Int64) {
 	runSnapshotGit(t, root, "init")
 	runSnapshotGit(t, root, "config", "user.email", "test@example.com")
 	runSnapshotGit(t, root, "config", "user.name", "Test")
-	for name, text := range map[string]string{".gitignore": ".grepai/\n", "main.go": "package main\nfunc main() {}\n", "other.go": "package main\nfunc other() {}\n"} {
+	for name, text := range files {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(text), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -218,5 +231,107 @@ func TestReconcileFailureDoesNotGrantSnapshot(t *testing.T) {
 	cancel()
 	if _, _, err := idx.scanner.ScanMetadataContext(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled walk: %v", err)
+	}
+}
+
+func TestReadGitScanStateIgnoresGrepaiConfigDir(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	root := t.TempDir()
+	runSnapshotGit(t, root, "init")
+	runSnapshotGit(t, root, "config", "user.email", "test@example.com")
+	runSnapshotGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runSnapshotGit(t, root, "add", ".")
+	runSnapshotGit(t, root, "commit", "-m", "first")
+	ctx := context.Background()
+	before, err := ReadGitScanState(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.Clean {
+		t.Fatal("committed fixture reported dirty")
+	}
+	// grepai's own snapshot file is the repo's only untracked content.
+	if err := os.MkdirAll(config.GetConfigDir(root), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.GetConfigDir(root), "scan-snapshot.gob"), []byte("state"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ReadGitScanState(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Clean {
+		t.Fatal("grepai's own config dir made the repo dirty")
+	}
+	if before.StatusHash != after.StatusHash {
+		t.Fatal("grepai's own config dir changed the status hash")
+	}
+}
+
+func TestReadGitScanStateStillReportsOtherUntrackedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not installed")
+	}
+	root := t.TempDir()
+	runSnapshotGit(t, root, "init")
+	runSnapshotGit(t, root, "config", "user.email", "test@example.com")
+	runSnapshotGit(t, root, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runSnapshotGit(t, root, "add", ".")
+	runSnapshotGit(t, root, "commit", "-m", "first")
+	if err := os.MkdirAll(config.GetConfigDir(root), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config.GetConfigDir(root), "scan-snapshot.gob"), []byte("state"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "extra.go"), []byte("package main\nfunc extra() {}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ReadGitScanState(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Clean {
+		t.Fatal("untracked file outside the config dir was hidden")
+	}
+}
+
+func TestReconcileGitFastPathWithUntrackedConfigDir(t *testing.T) {
+	// No committed .gitignore entry for .grepai/: the scan snapshot written
+	// during the first walk is the repo's only untracked content, as in every
+	// real indexed repo.
+	idx, st, calls := gitReconcileFixtureFiles(t, map[string]string{
+		"main.go":  "package main\nfunc main() {}\n",
+		"other.go": "package main\nfunc other() {}\n",
+	})
+	if !runGitReconcile(t, idx) || calls.Load() != 1 {
+		t.Fatal("first start did not walk")
+	}
+	if _, err := os.Stat(filepath.Join(config.GetConfigDir(idx.root), "scan-snapshot.gob")); err != nil {
+		t.Fatalf("scan snapshot not written into the config dir: %v", err)
+	}
+	saved := loadScanSnapshot(idx.root).gitState
+	if saved.HEAD == "" || !saved.Clean {
+		t.Fatalf("git state=%+v", saved)
+	}
+	// A restart must still skip the walk even though the receipt is stored in
+	// a directory git reports as untracked.
+	scan := idx.scanMetadata
+	idx = NewIndexer(idx.root, st, newMockEmbedder(), idx.chunker, idx.scanner, time.Now())
+	idx.scanMetadata = scan
+	if runGitReconcile(t, idx) || calls.Load() != 1 {
+		t.Fatal("untracked grepai config dir forced a second walk")
+	}
+	if _, skip := idx.CanSkipReconciliation(context.Background()); !skip {
+		t.Fatal("receipt stored in the untracked config dir did not authorize a skip")
 	}
 }

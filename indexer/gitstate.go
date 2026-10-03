@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/yoanbernabeu/grepai/config"
 )
 
 // GitScanState describes the work tree at a completed scan. Dirty porcelain
@@ -53,7 +55,16 @@ func ReadGitScanState(ctx context.Context, root string) (GitScanState, error) {
 	if err != nil {
 		return GitScanState{}, err
 	}
-	status, err := run("status", "--porcelain=v1", "-z", "--untracked-files=normal")
+	// grepai's own config directory is untracked in every indexed repo (it
+	// holds scan-snapshot.gob and friends), so without an exclude it keeps
+	// every repo dirty and the git receipt can never authorize skipping the
+	// startup walk. Exclude it with one pathspec when it lives inside root;
+	// when it is outside root or Rel fails, probe the whole tree as before.
+	statusArgs := []string{"status", "--porcelain=v1", "-z", "--untracked-files=normal"}
+	if rel, err := filepath.Rel(root, config.GetConfigDir(root)); err == nil && rel != "." && rel != ".." && !strings.HasPrefix(filepath.ToSlash(rel), "../") {
+		statusArgs = append(statusArgs, "--", ".", ":(exclude)"+filepath.ToSlash(rel))
+	}
+	status, err := run(statusArgs...)
 	if err != nil {
 		return GitScanState{}, err
 	}
