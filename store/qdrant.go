@@ -28,6 +28,44 @@ type QdrantStore struct {
 	apiKey         string
 }
 
+// qdrantScrollPageSize is the number of points requested per Scroll page in
+// scrollAll. Pages after the first are requested with the next-page offset
+// returned by the server, so the page size bounds only the size of one gRPC
+// response, not how many points are visited.
+const qdrantScrollPageSize = 10000
+
+// scrollAll visits every point of the collection (or of the filtered set when
+// filter is non-nil) by paging Scroll with the server-returned next-page
+// offset. The high-level client Scroll method returns only one page's points
+// and hides NextPageOffset; ScrollAndOffset exposes it so listings can stop
+// when the server returns a nil offset (end of the collection) or an empty
+// page instead of mistaking one page for the whole collection.
+// payloadFields selects the payload projection; it must include "file_path".
+func (s *QdrantStore) scrollAll(ctx context.Context, filter *qdrant.Filter, payloadFields []string) ([]*qdrant.RetrievedPoint, error) {
+	var all []*qdrant.RetrievedPoint
+	var offset *qdrant.PointId
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		points, next, err := s.client.ScrollAndOffset(ctx, &qdrant.ScrollPoints{
+			CollectionName: s.collectionName,
+			Filter:         filter,
+			Offset:         offset,
+			Limit:          qdrant.PtrOf(uint32(qdrantScrollPageSize)),
+			WithPayload:    qdrant.NewWithPayloadInclude(payloadFields...),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to scroll points: %w", err)
+		}
+		all = append(all, points...)
+		if len(points) == 0 || next == nil {
+			return all, nil
+		}
+		offset = next
+	}
+}
+
 func parseHost(endpoint string) string {
 	host := strings.TrimPrefix(endpoint, "http://")
 	host = strings.TrimPrefix(host, "https://")
@@ -399,11 +437,7 @@ func (s *QdrantStore) DeleteDocument(ctx context.Context, filePath string) error
 }
 
 func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Limit:          qdrant.PtrOf(uint32(1000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path"),
-	})
+	scrollResult, err := s.scrollAll(ctx, nil, []string{"file_path"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
 	}
@@ -457,11 +491,7 @@ func (s *QdrantStore) GetStats(ctx context.Context) (*IndexStats, error) {
 }
 
 func (s *QdrantStore) ListFilesWithStats(ctx context.Context) ([]FileStats, error) {
-	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
-		CollectionName: s.collectionName,
-		Limit:          qdrant.PtrOf(uint32(10000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line"),
-	})
+	scrollResult, err := s.scrollAll(ctx, nil, []string{"file_path", "start_line", "end_line"})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files: %w", err)
 	}

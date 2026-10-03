@@ -128,6 +128,59 @@ func TestQdrantGetDocumentFileHash(t *testing.T) {
 	}
 }
 
+// scrollPagesServer serves prepared Scroll pages, one per request, so tests
+// can drive scrollAll pagination without a running Qdrant.
+type scrollPagesServer struct {
+	qdrant.UnimplementedPointsServer
+	requests []*qdrant.ScrollPoints
+	pages    []*qdrant.ScrollResponse
+}
+
+func (s *scrollPagesServer) Scroll(_ context.Context, request *qdrant.ScrollPoints) (*qdrant.ScrollResponse, error) {
+	s.requests = append(s.requests, request)
+	if len(s.requests) > len(s.pages) {
+		return nil, status.Error(codes.OutOfRange, "no more pages prepared")
+	}
+	return s.pages[len(s.requests)-1], nil
+}
+
+func newScrollTestStore(t *testing.T, server *scrollPagesServer) (*QdrantStore, context.Context) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcServer := grpc.NewServer()
+	qdrant.RegisterPointsServer(grpcServer, server)
+	t.Cleanup(grpcServer.Stop)
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	}()
+	client, err := qdrant.NewClient(&qdrant.Config{Host: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, SkipCompatibilityCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	return &QdrantStore{client: client, collectionName: "test_grepai_scroll"}, ctx
+}
+
+func scrollPagePoint(t *testing.T, id uint64, path string) *qdrant.RetrievedPoint {
+	t.Helper()
+	payload := map[string]*qdrant.Value{}
+	if path != "" {
+		payload["file_path"] = mustCreateValue(t, path)
+	}
+	return &qdrant.RetrievedPoint{Id: qdrant.NewIDNum(id), Payload: payload}
+}
+
 func TestQdrantFileHashIntegration(t *testing.T) {
 	conn, err := net.DialTimeout("tcp", "127.0.0.1:6333", time.Second)
 	if err != nil {
@@ -221,7 +274,175 @@ func mustCreateValue(t *testing.T, value interface{}) *qdrant.Value {
 	return val
 }
 
+// TestQdrantListDocumentsPaginatesScroll verifies ListDocuments follows the
+// server-returned next-page offset across several pages and stops once the
+// final page reports a nil offset. Before pagination, a single
+// 1000-point Scroll page stood in for the whole collection, so files whose
+// points sat past the first page were never listed.
+func TestQdrantListDocumentsPaginatesScroll(t *testing.T) {
+	server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
+		{Result: []*qdrant.RetrievedPoint{
+			scrollPagePoint(t, 1, "first.go"),
+			scrollPagePoint(t, 2, "first.go"),
+			scrollPagePoint(t, 3, "second.go"),
+		}, NextPageOffset: qdrant.NewIDNum(3)},
+		{Result: []*qdrant.RetrievedPoint{
+			scrollPagePoint(t, 4, "third.go"),
+			// Empty file_path payloads must not enter the result.
+			scrollPagePoint(t, 5, ""),
+		}, NextPageOffset: qdrant.NewIDNum(5)},
+		{Result: []*qdrant.RetrievedPoint{
+			scrollPagePoint(t, 6, "fourth.go"),
+			scrollPagePoint(t, 7, "second.go"),
+		}, NextPageOffset: nil},
+	}}
+	s, ctx := newScrollTestStore(t, server)
+
+	paths, err := s.ListDocuments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]bool{"first.go": true, "second.go": true, "third.go": true, "fourth.go": true}
+	got := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		if got[path] {
+			t.Errorf("duplicate path %q in %v", path, paths)
+		}
+		got[path] = true
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListDocuments = %v, want %v", paths, want)
+	}
+	if len(server.requests) != len(server.pages) {
+		t.Fatalf("scroll called %d times, want %d (iteration must stop at the nil next offset)", len(server.requests), len(server.pages))
+	}
+	for i, request := range server.requests {
+		if request.GetCollectionName() != "test_grepai_scroll" {
+			t.Errorf("request %d collection = %q, want %q", i, request.GetCollectionName(), "test_grepai_scroll")
+		}
+		if request.GetLimit() != qdrantScrollPageSize {
+			t.Errorf("request %d limit = %d, want %d", i, request.GetLimit(), qdrantScrollPageSize)
+		}
+		if !proto.Equal(request.GetWithPayload(), qdrant.NewWithPayloadInclude("file_path")) {
+			t.Errorf("request %d payload = %v, want file_path only", i, request.GetWithPayload())
+		}
+	}
+	// Every page after the first must pass the prior page's offset.
+	for i := 1; i < len(server.requests); i++ {
+		if !proto.Equal(server.requests[i].GetOffset(), server.pages[i-1].GetNextPageOffset()) {
+			t.Errorf("request %d offset = %v, want %v", i, server.requests[i].GetOffset(), server.pages[i-1].GetNextPageOffset())
+		}
+	}
+}
+
+// TestQdrantListDocumentsStopsOnEmptyPage verifies pagination also stops when
+// the server returns points with no next-page offset and when it returns an
+// empty page while still advertising an offset.
+func TestQdrantListDocumentsStopsOnEmptyPage(t *testing.T) {
+	t.Run("empty collection returns no paths", func(t *testing.T) {
+		server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
+			{Result: nil, NextPageOffset: nil},
+		}}
+		s, ctx := newScrollTestStore(t, server)
+		paths, err := s.ListDocuments(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(paths) != 0 {
+			t.Fatalf("ListDocuments = %v, want empty", paths)
+		}
+		if len(server.requests) != 1 {
+			t.Fatalf("scroll called %d times, want 1", len(server.requests))
+		}
+	})
+
+	t.Run("empty page ends iteration even with an offset", func(t *testing.T) {
+		server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
+			{Result: []*qdrant.RetrievedPoint{scrollPagePoint(t, 1, "only.go")}, NextPageOffset: qdrant.NewIDNum(1)},
+			{Result: nil, NextPageOffset: qdrant.NewIDNum(99)},
+		}}
+		s, ctx := newScrollTestStore(t, server)
+		paths, err := s.ListDocuments(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]bool{"only.go": true}
+		got := make(map[string]bool, len(paths))
+		for _, path := range paths {
+			got[path] = true
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("ListDocuments = %v, want %v", paths, want)
+		}
+		if len(server.requests) != 2 {
+			t.Fatalf("scroll called %d times, want 2 (empty page must end iteration)", len(server.requests))
+		}
+	})
+}
+
+// TestQdrantScrollAllContextCancelled verifies scrollAll honors context
+// cancellation between pages instead of issuing the remaining pages.
+func TestQdrantScrollAllContextCancelled(t *testing.T) {
+	server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
+		{Result: []*qdrant.RetrievedPoint{scrollPagePoint(t, 1, "one.go")}, NextPageOffset: qdrant.NewIDNum(1)},
+		{Result: []*qdrant.RetrievedPoint{scrollPagePoint(t, 2, "two.go")}, NextPageOffset: nil},
+	}}
+	s, ctx := newScrollTestStore(t, server)
+	if _, err := s.ListDocuments(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(server.requests) != 2 {
+		t.Fatalf("setup: scroll called %d times, want 2", len(server.requests))
+	}
+
+	// A cancelled context must fail before the first page of a new listing.
+	ctx2, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := s.ListDocuments(ctx2); err == nil {
+		t.Fatal("expected context cancellation error")
+	}
+}
+
+// TestQdrantListFilesWithStatsPaginatesScroll verifies ListFilesWithStats
+// aggregates chunk counts across pages instead of counting one page only.
+func TestQdrantListFilesWithStatsPaginatesScroll(t *testing.T) {
+	server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
+		{Result: []*qdrant.RetrievedPoint{
+			scrollPagePoint(t, 1, "first.go"),
+			scrollPagePoint(t, 2, "first.go"),
+		}, NextPageOffset: qdrant.NewIDNum(2)},
+		{Result: []*qdrant.RetrievedPoint{
+			scrollPagePoint(t, 3, "first.go"),
+			scrollPagePoint(t, 4, "second.go"),
+		}, NextPageOffset: nil},
+	}}
+	s, ctx := newScrollTestStore(t, server)
+
+	files, err := s.ListFilesWithStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"first.go": 3, "second.go": 1}
+	got := make(map[string]int, len(files))
+	for _, file := range files {
+		got[file.Path] += file.ChunkCount
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ListFilesWithStats = %v, want %v", got, want)
+	}
+	if len(server.requests) != len(server.pages) {
+		t.Fatalf("scroll called %d times, want %d", len(server.requests), len(server.pages))
+	}
+	for i, request := range server.requests {
+		if !proto.Equal(request.GetWithPayload(), qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line")) {
+			t.Errorf("request %d payload = %v, want file_path, start_line, end_line", i, request.GetWithPayload())
+		}
+	}
+}
+
 // TestSanitizeCollectionName tests the exported SanitizeCollectionName function
+
 func TestSanitizeCollectionName(t *testing.T) {
 	tests := []struct {
 		name     string
