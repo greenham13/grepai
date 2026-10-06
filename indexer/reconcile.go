@@ -86,9 +86,12 @@ func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(contex
 			return nil, err
 		}
 		err := apply(func() error {
-			// A file created after enumeration must not be removed by this old walk.
+			// A file created after enumeration must not be removed by this old walk
+			// if the scanner would still enumerate it.
 			if _, err := os.Stat(filepath.Join(idx.root, path)); err == nil {
-				return nil
+				if idx.scanner != nil && idx.scanner.ShouldIndex(path) {
+					return nil
+				}
 			} else if !os.IsNotExist(err) {
 				return err
 			}

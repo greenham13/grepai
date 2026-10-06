@@ -155,6 +155,27 @@ func (s *Scanner) isSupported(ext string) bool {
 	return s.extraExts[ext]
 }
 
+// ShouldIndex reports whether scanMetadata would enumerate an existing file.
+// relPath is relative to the scanner root.
+func (s *Scanner) ShouldIndex(relPath string) bool {
+	for dir := filepath.Dir(relPath); dir != "."; dir = filepath.Dir(dir) {
+		if s.ignore.ShouldSkipDir(dir) {
+			return false
+		}
+	}
+	if s.ignore.ShouldIgnore(relPath) {
+		return false
+	}
+	if !s.isSupported(strings.ToLower(filepath.Ext(relPath))) {
+		return false
+	}
+	if isMinifiedFile(relPath) {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(s.root, relPath))
+	return err == nil && !info.IsDir() && info.Size() <= maxFileSize
+}
+
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
 func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {

@@ -85,6 +85,142 @@ func runGitReconcile(t *testing.T, idx *Indexer) bool {
 	return true
 }
 
+func TestReconcileRemovesIgnoredLeftoverDocuments(t *testing.T) {
+	idx, st, calls := gitReconcileFixture(t)
+	if !runGitReconcile(t, idx) || calls.Load() != 1 {
+		t.Fatal("first start did not index the fixture")
+	}
+	if doc, err := st.GetDocument(context.Background(), "main.go"); err != nil || doc == nil {
+		t.Fatalf("initial document: %v, %v", doc, err)
+	}
+	if err := os.WriteFile(filepath.Join(idx.root, ".grepaiignore"), []byte("main.go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runSnapshotGit(t, idx.root, "add", ".grepaiignore")
+	runSnapshotGit(t, idx.root, "commit", "-m", "ignore main.go")
+	ignore, err := NewIgnoreMatcher(idx.root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx.scanner = NewScanner(idx.root, ignore)
+	idx.scanMetadata = func(ctx context.Context) ([]FileMeta, []string, error) {
+		calls.Add(1)
+		return idx.scanner.ScanMetadataContext(ctx)
+	}
+	ctx := context.Background()
+	before, err := ReadGitScanState(ctx, idx.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var removed []string
+	stats, err := idx.Reconcile(ctx, func(run func() error) error { return run() }, func(path string, meta *FileMeta, changed bool) error {
+		if meta == nil && changed {
+			removed = append(removed, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesRemoved != 1 || len(removed) != 1 || removed[0] != "main.go" {
+		t.Fatalf("stats=%+v removed=%v", stats, removed)
+	}
+	if _, err := os.Stat(filepath.Join(idx.root, "main.go")); err != nil {
+		t.Fatalf("ignored file must remain on disk: %v", err)
+	}
+	if doc, err := st.GetDocument(ctx, "main.go"); err != nil || doc != nil {
+		t.Fatalf("ignored document remains: %v, %v", doc, err)
+	}
+	if err := idx.CompleteGitScan(ctx, before); err != nil {
+		t.Fatal(err)
+	}
+	if runGitReconcile(t, idx) || calls.Load() != 2 {
+		t.Fatalf("unchanged git state forced a walk: walks=%d", calls.Load())
+	}
+}
+
+func TestReconcileKeepsIndexableFileCreatedAfterEnumeration(t *testing.T) {
+	idx, st, _ := gitReconcileFixture(t)
+	runGitReconcile(t, idx)
+	path := filepath.Join(idx.root, "main.go")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	metas, _, err := idx.scanner.ScanMetadataContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, meta := range metas {
+		if meta.Path == "main.go" {
+			t.Fatal("missing file was enumerated")
+		}
+	}
+	idx.scanMetadata = func(context.Context) ([]FileMeta, []string, error) { return metas, nil, nil }
+	applyCount := 0
+	stats, err := idx.Reconcile(context.Background(), func(run func() error) error {
+		applyCount++
+		if applyCount == len(metas)+2 { // Snapshot, each file, then the leftover.
+			if err := os.WriteFile(path, []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+				return err
+			}
+		}
+		return run()
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applyCount != len(metas)+2 || stats.FilesRemoved != 0 {
+		t.Fatalf("apply calls=%d stats=%+v", applyCount, stats)
+	}
+	if doc, err := st.GetDocument(context.Background(), "main.go"); err != nil || doc == nil {
+		t.Fatalf("newly created file lost its document: %v, %v", doc, err)
+	}
+}
+
+func TestScannerShouldIndex(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".grepaiignore"), []byte("ignored.go\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{"build/docs", ".cursor"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{"build/docs/hidden.go", ".cursor/hidden.go", "ignored.go", "image.png", "app.min.js", "large.go", "normal.go"} {
+		if err := os.WriteFile(filepath.Join(root, path), []byte("test\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Truncate(filepath.Join(root, "large.go"), maxFileSize+1); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := NewIgnoreMatcher(root, []string{"build", ".cursor"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(root, ignore)
+	for _, test := range []struct {
+		path string
+		want bool
+	}{
+		{"build/docs/hidden.go", false},
+		{".cursor/hidden.go", false},
+		{"ignored.go", false},
+		{"image.png", false},
+		{"app.min.js", false},
+		{"large.go", false},
+		{"gone.go", false},
+		{"normal.go", true},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			if got := scanner.ShouldIndex(test.path); got != test.want {
+				t.Fatalf("ShouldIndex(%q)=%v, want %v", test.path, got, test.want)
+			}
+		})
+	}
+}
+
 func TestReconcileGitFastPath(t *testing.T) {
 	idx, st, calls := gitReconcileFixture(t)
 	if !runGitReconcile(t, idx) || calls.Load() != 1 {
