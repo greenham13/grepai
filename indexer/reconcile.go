@@ -13,9 +13,21 @@ import (
 // reads inside apply prevent an older walk result from overwriting a live edit.
 // onFile updates dependent indexes inside that same operation (nil means delete).
 func (idx *Indexer) Reconcile(ctx context.Context, apply func(func() error) error, onFile func(string, *FileMeta, bool) error) (*IndexStats, error) {
+	return idx.ReconcileWithDocuments(ctx, idx.store.ListDocuments, apply, onFile)
+}
+
+// ReconcileWithDocuments is Reconcile with the store listing supplied by the
+// caller. A workspace startup queue walks hundreds of projects against one
+// shared collection; listing that collection per project (millions of points
+// each time) is what the shared list avoids. list must return paths relative
+// to this root, as the store's own ListDocuments would.
+func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(context.Context) ([]string, error), apply func(func() error) error, onFile func(string, *FileMeta, bool) error) (*IndexStats, error) {
 	start := time.Now()
 	stats := &IndexStats{}
-	docs, err := idx.store.ListDocuments(ctx)
+	if list == nil {
+		list = idx.store.ListDocuments
+	}
+	docs, err := list(ctx)
 	if err != nil {
 		return nil, err
 	}

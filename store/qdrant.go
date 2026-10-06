@@ -29,24 +29,29 @@ type QdrantStore struct {
 }
 
 // qdrantScrollPageSize is the number of points requested per Scroll page in
-// scrollAll. Pages after the first are requested with the next-page offset
+// scrollPages. Pages after the first are requested with the next-page offset
 // returned by the server, so the page size bounds only the size of one gRPC
 // response, not how many points are visited.
 const qdrantScrollPageSize = 10000
 
-// scrollAll visits every point of the collection (or of the filtered set when
-// filter is non-nil) by paging Scroll with the server-returned next-page
-// offset. The high-level client Scroll method returns only one page's points
-// and hides NextPageOffset; ScrollAndOffset exposes it so listings can stop
-// when the server returns a nil offset (end of the collection) or an empty
-// page instead of mistaking one page for the whole collection.
+// scrollPages visits every point of the collection (or of the filtered set
+// when filter is non-nil) by paging Scroll with the server-returned next-page
+// offset, handing each page to visit as it arrives. The high-level client
+// Scroll method returns only one page's points and hides NextPageOffset;
+// ScrollAndOffset exposes it so listings can stop when the server returns a
+// nil offset (end of the collection) or an empty page instead of mistaking
+// one page for the whole collection.
+//
+// Pages are not retained: visit must copy whatever it needs out of the
+// points before returning. Collections can hold millions of points, so
+// accumulating them would cost hundreds of megabytes per listing.
 // payloadFields selects the payload projection; it must include "file_path".
-func (s *QdrantStore) scrollAll(ctx context.Context, filter *qdrant.Filter, payloadFields []string) ([]*qdrant.RetrievedPoint, error) {
-	var all []*qdrant.RetrievedPoint
+// A non-nil error from visit stops the scroll and is returned unchanged.
+func (s *QdrantStore) scrollPages(ctx context.Context, filter *qdrant.Filter, payloadFields []string, visit func(points []*qdrant.RetrievedPoint) error) error {
 	var offset *qdrant.PointId
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		points, next, err := s.client.ScrollAndOffset(ctx, &qdrant.ScrollPoints{
 			CollectionName: s.collectionName,
@@ -56,11 +61,15 @@ func (s *QdrantStore) scrollAll(ctx context.Context, filter *qdrant.Filter, payl
 			WithPayload:    qdrant.NewWithPayloadInclude(payloadFields...),
 		})
 		if err != nil {
-			return nil, fmt.Errorf("failed to scroll points: %w", err)
+			return fmt.Errorf("failed to scroll points: %w", err)
 		}
-		all = append(all, points...)
+		if len(points) > 0 {
+			if err := visit(points); err != nil {
+				return err
+			}
+		}
 		if len(points) == 0 || next == nil {
-			return all, nil
+			return nil
 		}
 		offset = next
 	}
@@ -437,16 +446,17 @@ func (s *QdrantStore) DeleteDocument(ctx context.Context, filePath string) error
 }
 
 func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
-	scrollResult, err := s.scrollAll(ctx, nil, []string{"file_path"})
+	pathsMap := make(map[string]struct{})
+	err := s.scrollPages(ctx, nil, []string{"file_path"}, func(points []*qdrant.RetrievedPoint) error {
+		for _, point := range points {
+			if val, ok := point.Payload["file_path"]; ok {
+				pathsMap[val.GetStringValue()] = struct{}{}
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
-	}
-
-	pathsMap := make(map[string]bool)
-	for _, point := range scrollResult {
-		if val, ok := point.Payload["file_path"]; ok {
-			pathsMap[val.GetStringValue()] = true
-		}
 	}
 
 	paths := make([]string, 0, len(pathsMap))
@@ -491,30 +501,31 @@ func (s *QdrantStore) GetStats(ctx context.Context) (*IndexStats, error) {
 }
 
 func (s *QdrantStore) ListFilesWithStats(ctx context.Context) ([]FileStats, error) {
-	scrollResult, err := s.scrollAll(ctx, nil, []string{"file_path", "start_line", "end_line"})
+	fileStats := make(map[string]*FileStats)
+	err := s.scrollPages(ctx, nil, []string{"file_path", "start_line", "end_line"}, func(points []*qdrant.RetrievedPoint) error {
+		for _, point := range points {
+			filePath := ""
+			if val, ok := point.Payload["file_path"]; ok {
+				filePath = val.GetStringValue()
+			}
+			if filePath == "" {
+				continue
+			}
+			stat, exists := fileStats[filePath]
+			if !exists {
+				stat = &FileStats{
+					Path:       filePath,
+					ChunkCount: 0,
+					ModTime:    time.Now(),
+				}
+				fileStats[filePath] = stat
+			}
+			stat.ChunkCount++
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list files: %w", err)
-	}
-
-	fileStats := make(map[string]*FileStats)
-	for _, point := range scrollResult {
-		filePath := ""
-		if val, ok := point.Payload["file_path"]; ok {
-			filePath = val.GetStringValue()
-		}
-
-		if filePath == "" {
-			continue
-		}
-
-		if _, exists := fileStats[filePath]; !exists {
-			fileStats[filePath] = &FileStats{
-				Path:       filePath,
-				ChunkCount: 0,
-				ModTime:    time.Now(),
-			}
-		}
-		fileStats[filePath].ChunkCount++
 	}
 
 	result := make([]FileStats, 0, len(fileStats))

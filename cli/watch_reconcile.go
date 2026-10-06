@@ -165,13 +165,53 @@ func runStartupReconciliation(ctx context.Context, projects []*workspaceProjectR
 	}
 }
 
+// sharedDocumentList is one lazily loaded read of the shared workspace
+// collection, owned by the single startup queue worker. Both the git-skip
+// checks and the walks read from it, so a startup queue over hundreds of
+// projects lists the collection once instead of once per project. On a
+// collection of millions of points each listing is hundreds of megabytes of
+// transient allocation, and the watcher runs under a small memory limit.
+// release drops the list once the queue finishes so it can be collected.
+type sharedDocumentList struct {
+	store     store.VectorStore
+	listed    bool
+	documents []string
+	listErr   error
+}
+
+func newSharedDocumentList(shared store.VectorStore) *sharedDocumentList {
+	return &sharedDocumentList{store: shared}
+}
+
+// forProject returns the shared listing filtered to one project's prefix,
+// loading the shared list on first use. The result is relative to the
+// project root, exactly as the project's own store.ListDocuments would be.
+func (l *sharedDocumentList) forProject(ctx context.Context, prefixed *projectPrefixStore) ([]string, error) {
+	if !l.listed {
+		l.documents, l.listErr = l.store.ListDocuments(ctx)
+		l.listed = true
+	}
+	if l.listErr != nil {
+		return nil, l.listErr
+	}
+	return prefixed.filterDocuments(l.documents), nil
+}
+
+// release forgets the shared list. A later use loads it again.
+func (l *sharedDocumentList) release() {
+	l.documents = nil
+	l.listErr = nil
+	l.listed = false
+}
+
 // workspaceReconciliationSkipper is owned by the single queue worker. It loads
 // the shared collection once, lazily after the first matching git receipt.
 // Each project still checks every snapshot entry against its own document set.
 func workspaceReconciliationSkipper(shared store.VectorStore) func(context.Context, *workspaceProjectRuntime) (string, bool) {
-	var listed bool
-	var documents []string
-	var listErr error
+	return workspaceReconciliationSkipperWithList(newSharedDocumentList(shared))
+}
+
+func workspaceReconciliationSkipperWithList(list *sharedDocumentList) func(context.Context, *workspaceProjectRuntime) (string, bool) {
 	return func(ctx context.Context, r *workspaceProjectRuntime) (string, bool) {
 		if !r.auxiliaryIndexesLoaded {
 			return "", false
@@ -181,16 +221,33 @@ func workspaceReconciliationSkipper(shared store.VectorStore) func(context.Conte
 			return r.idx.CanSkipReconciliation(ctx)
 		}
 		return r.idx.CanSkipReconciliationWithDocuments(ctx, func(ctx context.Context) ([]string, error) {
-			if !listed {
-				documents, listErr = shared.ListDocuments(ctx)
-				listed = true
-			}
-			if listErr != nil {
-				return nil, listErr
-			}
-			return prefixed.filterDocuments(documents), nil
+			return list.forProject(ctx, prefixed)
 		})
 	}
+}
+
+// workspaceReconciliationWalker walks one project with the shared listing.
+// Projects without a prefix store (none in workspace mode) list on their own.
+func workspaceReconciliationWalker(list *sharedDocumentList) func(context.Context, *workspaceProjectRuntime) error {
+	return func(ctx context.Context, r *workspaceProjectRuntime) error {
+		prefixed, ok := r.vectorStore.(*projectPrefixStore)
+		if !ok {
+			return reconcileWorkspaceProject(ctx, r)
+		}
+		return reconcileWorkspaceProjectWithDocuments(ctx, r, func(ctx context.Context) ([]string, error) {
+			return list.forProject(ctx, prefixed)
+		})
+	}
+}
+
+// runSharedStartupReconciliation runs one startup queue over projects with a
+// single shared collection read, and releases that read when the queue ends.
+func runSharedStartupReconciliation(ctx context.Context, projects []*workspaceProjectRuntime, delay, pace time.Duration, shared store.VectorStore) {
+	list := newSharedDocumentList(shared)
+	defer list.release()
+	runStartupReconciliation(ctx, projects, delay, pace,
+		workspaceReconciliationSkipperWithList(list),
+		workspaceReconciliationWalker(list))
 }
 
 func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence, shared store.VectorStore, runtimes map[string]*workspaceProjectRuntime, staleRequests <-chan struct{}) watchMutationWorker {
@@ -200,11 +257,10 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 	}
 	sort.Slice(projects, func(i, j int) bool { return projects[i].project.Name < projects[j].project.Name })
 	return startWatchMutationWorker(ctx, fence, func(ctx context.Context) {
-		runStartupReconciliation(ctx, projects,
+		runSharedStartupReconciliation(ctx, projects,
 			reconcileDuration("GREPAI_STARTUP_RECONCILE_DELAY", 15*time.Second),
 			reconcileDuration("GREPAI_STARTUP_RECONCILE_PACE", 250*time.Millisecond),
-			workspaceReconciliationSkipper(shared),
-			reconcileWorkspaceProject)
+			shared)
 		for {
 			select {
 			case <-ctx.Done():
@@ -219,10 +275,18 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 	})
 }
 
+// reconcileWorkspaceProject walks one project, listing its documents from its
+// own store. Live (non-startup) reconciles use this path.
 func reconcileWorkspaceProject(ctx context.Context, r *workspaceProjectRuntime) error {
+	return reconcileWorkspaceProjectWithDocuments(ctx, r, nil)
+}
+
+// reconcileWorkspaceProjectWithDocuments walks one project. A nil list means
+// the project's own store listing; the startup queue supplies a shared one.
+func reconcileWorkspaceProjectWithDocuments(ctx context.Context, r *workspaceProjectRuntime, list func(context.Context) ([]string, error)) error {
 	before, _ := indexer.ReadGitScanState(ctx, r.project.Path)
 	apply := func(run func() error) error { return r.applyReconcile(ctx, run) }
-	stats, err := r.idx.Reconcile(ctx, apply, func(path string, meta *indexer.FileMeta, changed bool) error {
+	stats, err := r.idx.ReconcileWithDocuments(ctx, list, apply, func(path string, meta *indexer.FileMeta, changed bool) error {
 		if meta == nil {
 			return r.symbolStore.DeleteFile(ctx, path)
 		}

@@ -129,7 +129,7 @@ func TestQdrantGetDocumentFileHash(t *testing.T) {
 }
 
 // scrollPagesServer serves prepared Scroll pages, one per request, so tests
-// can drive scrollAll pagination without a running Qdrant.
+// can drive scrollPages pagination without a running Qdrant.
 type scrollPagesServer struct {
 	qdrant.UnimplementedPointsServer
 	requests []*qdrant.ScrollPoints
@@ -381,9 +381,9 @@ func TestQdrantListDocumentsStopsOnEmptyPage(t *testing.T) {
 	})
 }
 
-// TestQdrantScrollAllContextCancelled verifies scrollAll honors context
+// TestQdrantScrollPagesContextCancelled verifies scrollPages honors context
 // cancellation between pages instead of issuing the remaining pages.
-func TestQdrantScrollAllContextCancelled(t *testing.T) {
+func TestQdrantScrollPagesContextCancelled(t *testing.T) {
 	server := &scrollPagesServer{pages: []*qdrant.ScrollResponse{
 		{Result: []*qdrant.RetrievedPoint{scrollPagePoint(t, 1, "one.go")}, NextPageOffset: qdrant.NewIDNum(1)},
 		{Result: []*qdrant.RetrievedPoint{scrollPagePoint(t, 2, "two.go")}, NextPageOffset: nil},
