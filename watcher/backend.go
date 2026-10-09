@@ -15,18 +15,18 @@ const subscriberEventBuffer = 1024
 
 var errBackendClosedForSubscribe = errors.New("shared filesystem watcher is closed")
 
-// Backend owns exactly one fsnotify.Watcher (one inotify instance on Linux,
-// one kqueue on BSD/macOS) and fans its events out to every Watcher that
-// subscribed to it. A workspace of N projects therefore costs one inotify
-// instance instead of N, which keeps it under the per-user
-// fs.inotify.max_user_instances cap (128 by default) that a per-project
-// fsnotify.Watcher exhausts once a workspace grows past roughly a hundred
-// projects.
+// Backend owns exactly one event source (one inotify instance on Linux, one
+// ReadDirectoryChangesW watcher on Windows, the directory poller on macOS;
+// see notifier.go) and fans its events out to every Watcher that subscribed
+// to it. A workspace of N projects therefore costs one inotify instance
+// instead of N, which keeps it under the per-user fs.inotify.max_user_instances
+// cap (128 by default) that a per-project fsnotify.Watcher exhausts once a
+// workspace grows past roughly a hundred projects.
 //
 // Directory registrations are reference counted: nested roots may register
 // the same directory, and it stays watched until the last of them removes it.
 type Backend struct {
-	fsw *fsnotify.Watcher
+	fsw notifier
 
 	mu          sync.RWMutex
 	subscribers map[*Watcher]struct{}
@@ -38,20 +38,24 @@ type Backend struct {
 	dispatchDone chan struct{}
 }
 
-// NewBackend creates the single fsnotify.Watcher the subscribers share.
+// NewBackend creates the single event source the subscribers share.
 func NewBackend() (*Backend, error) {
-	fsw, err := fsnotify.NewWatcher()
+	source, err := newNotifier()
 	if err != nil {
 		return nil, &RegistrationError{Operation: "create filesystem watcher", Path: "", Cause: err}
 	}
+	return newBackendWith(source), nil
+}
+
+func newBackendWith(source notifier) *Backend {
 	b := &Backend{
-		fsw:          fsw,
+		fsw:          source,
 		subscribers:  make(map[*Watcher]struct{}),
 		refs:         make(map[string]int),
 		dispatchDone: make(chan struct{}),
 	}
 	go b.dispatch()
-	return b, nil
+	return b
 }
 
 // Add registers one directory with the shared fsnotify instance, counting a
@@ -133,7 +137,7 @@ func (b *Backend) dispatch() {
 	defer close(b.dispatchDone)
 	for {
 		select {
-		case event, ok := <-b.fsw.Events:
+		case event, ok := <-b.fsw.Events():
 			if !ok {
 				b.closeSubscriberChannels()
 				return
@@ -147,7 +151,7 @@ func (b *Backend) dispatch() {
 				case <-w.done:
 				}
 			}
-		case err, ok := <-b.fsw.Errors:
+		case err, ok := <-b.fsw.Errors():
 			if !ok {
 				b.closeSubscriberChannels()
 				return
