@@ -629,17 +629,28 @@ func (idx *Indexer) indexFilesBatched(
 		chunksCreated += len(chunks)
 	}
 
-	// Embed remaining (non-cached) files
-	if len(remainingFileChunks) > 0 {
-		batches := embedder.FormBatches(remainingFileChunks)
-		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
+	// Embed remaining (non-cached) files one window at a time and store each
+	// window before embedding the next, so a failure late in a large first
+	// index keeps everything before it and a restart resumes (F-112).
+	windows := formEmbedWindows(remainingFileChunks)
+	totalBatches, totalChunks := 0, 0
+	for _, w := range windows {
+		totalBatches += len(w.batches)
+		totalChunks += w.chunks
+	}
+	batchOffset, chunkOffset := 0, 0
+	for _, w := range windows {
+		results, err := batchEmb.EmbedBatches(ctx, w.batches, windowBatchProgress(onProgress, batchOffset, totalBatches, chunkOffset, totalChunks))
 		if err != nil {
+			if flushErr := buf.flush(ctx); flushErr != nil {
+				log.Printf("Warning: could not store files embedded before the failure: %v", flushErr)
+			}
 			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
 		}
 
-		fileEmbeddings := embedder.MapResultsToFiles(batches, results, len(files))
+		fileEmbeddings := embedder.MapResultsToFiles(w.batches, results, len(files))
 
-		for _, fd := range remainingFileData {
+		for _, fd := range remainingFileData[w.start:w.end] {
 			embeddings := fileEmbeddings[fd.fileIndex]
 			if len(embeddings) != len(fd.chunkInfos) {
 				log.Printf("Warning: embedding count mismatch for %s: got %d, expected %d",
@@ -654,6 +665,14 @@ func (idx *Indexer) indexFilesBatched(
 			filesIndexed++
 			chunksCreated += len(chunks)
 		}
+		if err := buf.flush(ctx); err != nil {
+			return filesIndexed, chunksCreated, err
+		}
+		if err := idx.PersistScanSnapshot(ctx, false); err != nil {
+			log.Printf("Warning: %v", err)
+		}
+		batchOffset += len(w.batches)
+		chunkOffset += w.chunks
 	}
 
 	if err := buf.flush(ctx); err != nil {
@@ -661,6 +680,45 @@ func (idx *Indexer) indexFilesBatched(
 	}
 
 	return filesIndexed, chunksCreated, nil
+}
+
+// embedWindowChunks is the most chunks embedded before their files are
+// stored. Small enough that a slow CPU embedder stores progress every few
+// minutes, large enough to keep several full batches in flight.
+var embedWindowChunks = 8 * embedder.MaxBatchSize
+
+// embedWindow is a run of files, [start,end) in the file list passed to
+// formEmbedWindows, embedded and stored together.
+type embedWindow struct {
+	start, end int
+	chunks     int
+	batches    []embedder.Batch
+}
+
+func formEmbedWindows(files []embedder.FileChunks) []embedWindow {
+	var windows []embedWindow
+	for start := 0; start < len(files); {
+		end, chunks := start, 0
+		for end < len(files) && (end == start || chunks+len(files[end].Chunks) <= embedWindowChunks) {
+			chunks += len(files[end].Chunks)
+			end++
+		}
+		windows = append(windows, embedWindow{start: start, end: end, chunks: chunks, batches: embedder.FormBatches(files[start:end])})
+		start = end
+	}
+	return windows
+}
+
+// windowBatchProgress reports one window's batch progress against the totals
+// of the whole run, so the bar does not restart at every window.
+func windowBatchProgress(onProgress BatchProgressCallback, batchOffset, totalBatches, chunkOffset, totalChunks int) embedder.BatchProgress {
+	report := wrapBatchProgress(onProgress)
+	if report == nil {
+		return nil
+	}
+	return func(batchIndex, _, completedChunks, _ int, retrying bool, attempt int, statusCode int) {
+		report(batchOffset+batchIndex, totalBatches, chunkOffset+completedChunks, totalChunks, retrying, attempt, statusCode)
+	}
 }
 
 // maxReChunkAttempts is the maximum number of times we'll try to re-chunk

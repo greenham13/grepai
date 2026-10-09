@@ -1436,3 +1436,111 @@ type failingSaveStore struct{ *mockStore }
 func (f *failingSaveStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
 	return fmt.Errorf("disk full")
 }
+
+// windowFailEmbedder embeds normally for its first okCalls EmbedBatches calls
+// and fails every later one; it counts the chunks it embedded.
+type windowFailEmbedder struct {
+	*mockBatchEmbedder
+	okCalls  int
+	calls    int
+	embedded int
+}
+
+func (w *windowFailEmbedder) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
+	w.calls++
+	if w.okCalls >= 0 && w.calls > w.okCalls {
+		return nil, fmt.Errorf("batch 1/%d: Client.Timeout exceeded", len(batches))
+	}
+	for _, b := range batches {
+		w.embedded += b.Size()
+	}
+	return w.mockBatchEmbedder.EmbedBatches(ctx, batches, progress)
+}
+
+func TestIndexAll_EmbedFailureKeepsEarlierWindowsAndResumes(t *testing.T) {
+	old := embedWindowChunks
+	embedWindowChunks = 40
+	t.Cleanup(func() { embedWindowChunks = old })
+
+	root := t.TempDir()
+	const fileCount = 30
+	for i := 0; i < fileCount; i++ {
+		var b strings.Builder
+		for l := 0; l < 40; l++ {
+			fmt.Fprintf(&b, "func f%d_%d() { return %d }\n", i, l, l)
+		}
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file%02d.go", i)), []byte(b.String()), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backing := newMockStore()
+
+	failing := &windowFailEmbedder{mockBatchEmbedder: newMockBatchEmbedder(), okCalls: 1}
+	first := NewIndexer(root, backing, failing, NewChunker(128, 10), NewScanner(root, ignore), time.Time{})
+	if _, err := first.IndexAll(context.Background()); err == nil {
+		t.Fatal("IndexAll succeeded although the second embed window failed")
+	}
+	saved := len(backing.documents)
+	if saved == 0 || saved >= fileCount {
+		t.Fatalf("after the failure the store holds %d of %d files; want the first window kept and the rest missing", saved, fileCount)
+	}
+
+	resumed := &windowFailEmbedder{mockBatchEmbedder: newMockBatchEmbedder(), okCalls: -1}
+	second := NewIndexer(root, backing, resumed, NewChunker(128, 10), NewScanner(root, ignore), time.Time{})
+	stats, err := second.IndexAll(context.Background())
+	if err != nil {
+		t.Fatalf("resumed IndexAll: %v", err)
+	}
+	if len(backing.documents) != fileCount {
+		t.Fatalf("store holds %d documents after resume, want %d", len(backing.documents), fileCount)
+	}
+	if stats.FilesIndexed != fileCount-saved {
+		t.Fatalf("resume indexed %d files, want only the %d missing ones", stats.FilesIndexed, fileCount-saved)
+	}
+	if resumed.embedded+failing.embedded != len(backing.chunks) {
+		t.Fatalf("embedded %d+%d chunks for %d stored: the resume re-embedded saved files", failing.embedded, resumed.embedded, len(backing.chunks))
+	}
+}
+
+func TestIndexFilesBatched_ProgressSpansAllWindows(t *testing.T) {
+	old := embedWindowChunks
+	embedWindowChunks = 40
+	t.Cleanup(func() { embedWindowChunks = old })
+
+	root := t.TempDir()
+	var files []FileInfo
+	for i := 0; i < 12; i++ {
+		var b strings.Builder
+		for l := 0; l < 40; l++ {
+			fmt.Fprintf(&b, "func g%d_%d() { return %d }\n", i, l, l)
+		}
+		files = append(files, FileInfo{Path: fmt.Sprintf("g%02d.go", i), Content: b.String(), Hash: fmt.Sprintf("h%d", i)})
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := NewIndexer(root, newMockStore(), newMockEmbedder(), NewChunker(128, 10), NewScanner(root, ignore), time.Time{})
+	var last BatchProgressInfo
+	calls := 0
+	_, chunks, err := idx.indexFilesBatched(context.Background(), files, newMockBatchEmbedder(), func(info BatchProgressInfo) {
+		calls++
+		if info.CompletedChunks < last.CompletedChunks {
+			t.Fatalf("progress went backwards: %d after %d", info.CompletedChunks, last.CompletedChunks)
+		}
+		last = info
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls < 2 {
+		t.Fatalf("test needs several windows, got %d progress calls", calls)
+	}
+	if last.CompletedChunks != chunks || last.TotalChunks != chunks || last.BatchIndex != last.TotalBatches-1 {
+		t.Fatalf("final progress %+v, want %d/%d chunks on the last batch", last, chunks, chunks)
+	}
+}

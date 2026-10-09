@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,6 +26,9 @@ type fakeOllama struct {
 	maxFlight  atomic.Int32
 	delay      time.Duration
 	failStatus int // when non-zero, every request fails with this status
+	// stallAbove > 0 makes requests with more inputs than this hang until the
+	// client gives up, like a CPU-bound Ollama that cannot answer in time.
+	stallAbove int
 }
 
 func (f *fakeOllama) handler(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +64,11 @@ func (f *fakeOllama) handler(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.requests = append(f.requests, req)
 	f.mu.Unlock()
+
+	if f.stallAbove > 0 && len(req.Input) > f.stallAbove {
+		<-r.Context().Done()
+		return
+	}
 
 	if f.failStatus != 0 {
 		http.Error(w, `{"error":"boom"}`, f.failStatus)
@@ -404,5 +413,93 @@ func TestWithOllamaParallelism_IgnoresNonPositive(t *testing.T) {
 	WithOllamaParallelism(7)(e)
 	if e.parallelism != 7 {
 		t.Fatalf("parallelism = %d, want 7", e.parallelism)
+	}
+}
+
+func TestOllamaEmbedBatch_SplitsTimedOutRequestInsteadOfFailing(t *testing.T) {
+	f, e := newFakeOllama(t)
+	f.stallAbove = 2
+	WithOllamaTimeout(300 * time.Millisecond)(e)
+
+	texts := []string{"a1", "bb2", "ccc3", "dddd4", "eeeee6", "f7"}
+	vectors, err := e.EmbedBatch(context.Background(), texts)
+	if err != nil {
+		t.Fatalf("EmbedBatch: %v", err)
+	}
+	for i, text := range texts {
+		if want := vectorFor(text); vectors[i][0] != want[0] || vectors[i][1] != want[1] {
+			t.Fatalf("vector %d = %v, want %v", i, vectors[i], want)
+		}
+	}
+}
+
+func TestOllamaEmbedBatches_SplitsTimedOutRequestInsteadOfFailing(t *testing.T) {
+	f, e := newFakeOllama(t)
+	f.stallAbove = 3
+	WithOllamaTimeout(300 * time.Millisecond)(e)
+
+	batches := []Batch{{Index: 0, Entries: []BatchEntry{
+		{FileIndex: 0, ChunkIndex: 0, Content: "one"},
+		{FileIndex: 0, ChunkIndex: 1, Content: "two2"},
+		{FileIndex: 1, ChunkIndex: 0, Content: "three"},
+		{FileIndex: 1, ChunkIndex: 1, Content: "four44"},
+		{FileIndex: 2, ChunkIndex: 0, Content: "five555"},
+	}}}
+	results, err := e.EmbedBatches(context.Background(), batches, nil)
+	if err != nil {
+		t.Fatalf("EmbedBatches: %v", err)
+	}
+	for i, entry := range batches[0].Entries {
+		if got, want := results[0].Embeddings[i], vectorFor(entry.Content); got[0] != want[0] || got[1] != want[1] {
+			t.Fatalf("vector %d = %v, want %v", i, got, want)
+		}
+	}
+}
+
+func TestOllamaEmbedBatch_GivesUpAfterTimeoutBudget(t *testing.T) {
+	f := &fakeOllama{t: t}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests = append(f.requests, ollamaEmbedRequest{})
+		f.mu.Unlock()
+		// Consume the body so the server notices when the client hangs up.
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	hung := NewOllamaEmbedder(WithOllamaEndpoint(srv.URL), WithOllamaTimeout(100*time.Millisecond))
+
+	_, err := hung.EmbedBatch(context.Background(), []string{"a", "b", "c", "d"})
+	if err == nil {
+		t.Fatal("EmbedBatch against a hung Ollama succeeded")
+	}
+	if !isRequestTimeout(context.Background(), err) {
+		t.Fatalf("error is not a timeout: %v", err)
+	}
+	if got, want := f.requestCount(), 1+ollamaTimeoutBudget; got != want {
+		t.Fatalf("requests = %d, want %d (first try plus the timeout budget)", got, want)
+	}
+}
+
+func TestOllamaEmbed_CallerCancelIsNotRetried(t *testing.T) {
+	f := &fakeOllama{t: t}
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests = append(f.requests, ollamaEmbedRequest{})
+		f.mu.Unlock()
+		// Consume the body so the server notices when the client hangs up.
+		_, _ = io.Copy(io.Discard, r.Body)
+		cancel()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	e := NewOllamaEmbedder(WithOllamaEndpoint(srv.URL))
+
+	if _, err := e.EmbedBatch(ctx, []string{"a", "b"}); err == nil {
+		t.Fatal("EmbedBatch with a cancelled context succeeded")
+	}
+	if got := f.requestCount(); got != 1 {
+		t.Fatalf("requests = %d, want 1: a cancelled caller must not be retried", got)
 	}
 }

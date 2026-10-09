@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -33,6 +35,17 @@ const (
 	// ollamaMaxBatchChars bounds the total input text of one /api/embed
 	// request so a batch of large chunks does not become a huge request body.
 	ollamaMaxBatchChars = 256 * 1024
+
+	// defaultOllamaTimeout bounds one /api/embed request, including the time
+	// it waits in Ollama's queue behind the other parallel requests. On a CPU
+	// only machine a 64-input request can take minutes, and the first one also
+	// loads the model; 60 s failed every first index there (F-112).
+	defaultOllamaTimeout = 10 * time.Minute
+
+	// ollamaTimeoutBudget is how many timed-out requests one sub-batch may
+	// absorb (splitting in half, then retrying single inputs) before the
+	// error is returned. It bounds the time lost to an Ollama that hangs.
+	ollamaTimeoutBudget = 4
 )
 
 type OllamaEmbedder struct {
@@ -102,7 +115,7 @@ func NewOllamaEmbedder(opts ...OllamaOption) *OllamaEmbedder {
 		dimensions:  nomicEmbedDimensions,
 		parallelism: defaultOllamaParallelism,
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: defaultOllamaTimeout,
 		},
 	}
 
@@ -133,7 +146,7 @@ func (e *OllamaEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 
 	for start := 0; start < len(texts); {
 		end := e.subBatchEnd(texts, start)
-		vectors, err := e.embedInputs(ctx, texts[start:end], false)
+		vectors, err := e.embedInputsRetryingTimeouts(ctx, texts[start:end], false)
 		if err != nil {
 			if AsContextLengthError(err) == nil {
 				return nil, fmt.Errorf("failed to embed texts %d-%d: %w", start, end-1, err)
@@ -213,7 +226,7 @@ func (e *OllamaEmbedder) embedBatchTruncatingOversized(ctx context.Context, batc
 
 	for start := 0; start < len(texts); {
 		end := e.subBatchEnd(texts, start)
-		vectors, err := e.embedInputs(ctx, texts[start:end], false)
+		vectors, err := e.embedInputsRetryingTimeouts(ctx, texts[start:end], false)
 		if err == nil {
 			copy(results[start:end], vectors)
 			start = end
@@ -273,6 +286,52 @@ func (e *OllamaEmbedder) locateContextLengthError(ctx context.Context, texts []s
 		return 0, fmt.Errorf("failed to embed text %d: %w", i, err)
 	}
 	return 0, fmt.Errorf("Ollama rejected a batch of %d inputs for context length, but every input embeds on its own", len(texts))
+}
+
+// embedInputsRetryingTimeouts is embedInputs that survives slow requests: a
+// request that times out is split in half and each half sent again, and a
+// single input is resent, until ollamaTimeoutBudget timeouts are spent.
+func (e *OllamaEmbedder) embedInputsRetryingTimeouts(ctx context.Context, inputs []string, truncate bool) ([][]float32, error) {
+	budget := ollamaTimeoutBudget
+	return e.embedSplittingOnTimeout(ctx, inputs, truncate, &budget)
+}
+
+func (e *OllamaEmbedder) embedSplittingOnTimeout(ctx context.Context, inputs []string, truncate bool, budget *int) ([][]float32, error) {
+	for {
+		vectors, err := e.embedInputs(ctx, inputs, truncate)
+		if err == nil || !isRequestTimeout(ctx, err) || *budget <= 0 {
+			return vectors, err
+		}
+		*budget--
+		if len(inputs) == 1 {
+			log.Printf("Ollama: /api/embed of 1 input timed out; retrying (%v)", err)
+			continue
+		}
+		mid := len(inputs) / 2
+		log.Printf("Ollama: /api/embed of %d inputs timed out; retrying as %d + %d (%v)", len(inputs), mid, len(inputs)-mid, err)
+		left, err := e.embedSplittingOnTimeout(ctx, inputs[:mid], truncate, budget)
+		if err != nil {
+			return nil, err
+		}
+		right, err := e.embedSplittingOnTimeout(ctx, inputs[mid:], truncate, budget)
+		if err != nil {
+			return nil, err
+		}
+		return append(left, right...), nil
+	}
+}
+
+// isRequestTimeout reports whether err is the HTTP client's own timeout, not
+// a cancellation of the caller's context.
+func isRequestTimeout(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // embedInputs sends one POST /api/embed request for inputs and returns one
