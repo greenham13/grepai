@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -19,7 +20,10 @@ var vueProcessorScript string
 type VueProcessor struct {
 	nodePath string
 	mu       sync.RWMutex
-	missing  string
+	// missing records directories whose ancestor chain has no
+	// @vue/compiler-sfc, keyed by directory. One project without the compiler
+	// must not switch off the compiler for sibling projects that have one.
+	missing map[string]string
 }
 
 func NewVueProcessor(nodePath string) *VueProcessor {
@@ -59,7 +63,7 @@ type vueScriptOutput struct {
 }
 
 func (p *VueProcessor) transform(ctx context.Context, filePath, source string) (TransformResult, error) {
-	if msg, ok := p.missingCompilerMessage(); ok {
+	if msg, ok := p.missingCompilerMessage(filePath); ok {
 		return p.fallbackWithCompilerWarning(filePath, source, msg)
 	}
 
@@ -75,7 +79,7 @@ func (p *VueProcessor) transform(ctx context.Context, filePath, source string) (
 		msg := strings.TrimSpace(stderr.String())
 		if isMissingVueCompiler(msg) {
 			msg = normalizeMissingVueCompilerMessage(filePath)
-			p.setMissingCompilerMessage(msg)
+			p.setMissingCompilerMessage(filePath, msg)
 		}
 		fallback, fbErr := p.fallback(filePath, source)
 		if fbErr == nil {
@@ -142,23 +146,41 @@ func pathDir(filePath string) string {
 	return filePath[:lastSlash]
 }
 
-func (p *VueProcessor) missingCompilerMessage() (string, bool) {
+func (p *VueProcessor) missingCompilerMessage(filePath string) (string, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	return p.missing, p.missing != ""
+	msg, ok := p.missing[filepath.Clean(pathDir(filePath))]
+	return msg, ok
 }
 
-func (p *VueProcessor) setMissingCompilerMessage(msg string) {
+// setMissingCompilerMessage marks every directory the script's resolution
+// walked (the file's directory and its ancestors): none of them can resolve
+// the compiler, so files directly in any of them skip the node spawn. A
+// subdirectory may still carry its own node_modules and is not marked.
+func (p *VueProcessor) setMissingCompilerMessage(filePath, msg string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.missing == "" {
-		p.missing = msg
+	if p.missing == nil {
+		p.missing = make(map[string]string)
+	}
+	dir := filepath.Clean(pathDir(filePath))
+	for {
+		if _, seen := p.missing[dir]; !seen {
+			p.missing[dir] = msg
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return
+		}
+		dir = parent
 	}
 }
 
 var scriptBlockRE = regexp.MustCompile(`(?is)<script\b[^>]*>(.*?)</script>`)
 var styleBlockRE = regexp.MustCompile(`(?is)<style\b[^>]*>(.*?)</style>`)
-var vueTemplateCtxIdentRE = regexp.MustCompile(`\b_ctx\.([A-Za-z_$][A-Za-z0-9_$]*)\b`)
+
+// Vue 3 render code reads `_ctx.name`; Vue 2.7 render code reads `_vm.name`.
+var vueTemplateCtxIdentRE = regexp.MustCompile(`\b_(?:ctx|vm)\.([A-Za-z_$][A-Za-z0-9_$]*)\b`)
 
 func (p *VueProcessor) fallback(filePath, source string) (TransformResult, error) {
 	matches := scriptBlockRE.FindAllStringSubmatchIndex(source, -1)
@@ -173,9 +195,10 @@ func (p *VueProcessor) fallback(filePath, source string) (TransformResult, error
 		if strings.TrimSpace(block) == "" {
 			continue
 		}
+		// The newline only ends the previous generated line; the next block's
+		// first line follows it directly, so no map entry belongs here.
 		if idx > 0 && out.Len() > 0 {
 			out.WriteString("\n")
-			mapping = append(mapping, 0)
 		}
 
 		sourceStart := strings.Count(source[:start], "\n") + 1
@@ -207,7 +230,6 @@ func (p *VueProcessor) fallback(filePath, source string) (TransformResult, error
 		}
 		if out.Len() > 0 {
 			out.WriteString("\n")
-			mapping = append(mapping, 0)
 		}
 		header := fmt.Sprintf("function __vue_style_bindings__%d() {", styleBindingIndex)
 		out.WriteString(header)
