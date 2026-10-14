@@ -11,7 +11,16 @@ for await (const chunk of process.stdin) {
 const input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 const source = input.source ?? "";
 const filePath = input.filePath ?? "Component.vue";
-const absoluteFilePath = path.isAbsolute(filePath) ? filePath : path.resolve(process.cwd(), filePath);
+// filePath is the index identity (relative to the project root in production);
+// resolvePath is where the file lives, supplied by the Go side so that a
+// workspace watcher serving many projects from one cwd resolves each file's
+// own @vue/compiler-sfc.
+const absoluteFilePath =
+  typeof input.resolvePath === "string" && input.resolvePath !== ""
+    ? input.resolvePath
+    : path.isAbsolute(filePath)
+      ? filePath
+      : path.resolve(process.cwd(), filePath);
 
 function candidateResolveDirs(startFilePath) {
   const dirs = [];
@@ -86,21 +95,24 @@ function hasBlocks(d) {
 // Vue 2.7: parse(options) -> SFCDescriptor (errors on the descriptor). Passing
 // the source string as the options object does not throw there; it returns a
 // descriptor whose blocks are all null.
+// Both default sourceMap to true and build a map per block; nothing here
+// reads it.
 function parseDescriptor(parse, major, source, filename) {
+  const options = { filename, sourceMap: false };
   if (major >= 3) {
-    const parsed = parse(source, { filename });
+    const parsed = parse(source, options);
     return { descriptor: parsed?.descriptor, errors: parsed?.errors ?? [] };
   }
   if (major === 2) {
-    const d = parse({ source, filename });
+    const d = parse({ source, ...options });
     return { descriptor: d, errors: d?.errors ?? [] };
   }
-  const parsed = parse(source, { filename });
+  const parsed = parse(source, options);
   if (parsed && typeof parsed === "object" && "descriptor" in parsed) {
     return { descriptor: parsed.descriptor, errors: parsed.errors ?? [] };
   }
   if (isDescriptor(parsed) && !hasBlocks(parsed)) {
-    const d = parse({ source, filename });
+    const d = parse({ source, ...options });
     return { descriptor: d, errors: d?.errors ?? [] };
   }
   return { descriptor: parsed, errors: parsed?.errors ?? [] };
@@ -258,6 +270,10 @@ try {
         source: d.template.content,
         filename: filePath,
         scoped: Boolean(d.styles?.some((s) => s.scoped)),
+        // Vue 2.7 defaults prettify to true and runs prettier on the render
+        // code (≈120 ms vs ≈5 ms per file); a hoisted prettier 3 would even
+        // hand back a Promise. Vue 3 ignores the option.
+        prettify: false,
       });
     } catch (err) {
       compiled = { errors: [err] };
@@ -267,6 +283,8 @@ try {
       // Vue 3 reports the same template error from parse(); one line is enough.
       if (message === parseMessage) warnings.delete(`vue parse error in ${filePath}: ${parseMessage}`);
       warnings.add(`vue template skipped for ${filePath}: ${message}`);
+    } else if (compiled?.code !== undefined && compiled?.code !== null && typeof compiled.code !== "string") {
+      warnings.add(`vue template skipped for ${filePath}: compiler returned ${compiled.code instanceof Promise ? "a Promise" : typeof compiled.code} instead of code`);
     } else if (compiled?.code) {
       separator();
       pushUnmapped(out, map, compiled.code);

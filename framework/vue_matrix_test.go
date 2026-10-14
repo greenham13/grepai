@@ -7,7 +7,7 @@ import (
 )
 
 func TestVueProcessorFallback_Matrix(t *testing.T) {
-	p := NewVueProcessor("node")
+	p := NewVueProcessor("node", "")
 
 	tests := []struct {
 		name         string
@@ -103,7 +103,7 @@ function getBg() { return '#fff' }
 }
 
 func TestVueProcessorTransform_CompilerUnavailableFallsBackViaRegistryAuto(t *testing.T) {
-	p := NewVueProcessor("node-does-not-exist")
+	p := NewVueProcessor("node-does-not-exist", "")
 	r := NewProcessorRegistry(RegistryConfig{Enabled: true, Mode: ModeAuto, EnableVue: true}, p)
 
 	source := `<template><div/></template>
@@ -124,7 +124,7 @@ const value = 123
 }
 
 func TestVueProcessorTransform_CompilerUnavailableRequireFails(t *testing.T) {
-	p := NewVueProcessor("node-does-not-exist")
+	p := NewVueProcessor("node-does-not-exist", "")
 	r := NewProcessorRegistry(RegistryConfig{Enabled: true, Mode: ModeRequire, EnableVue: true}, p)
 
 	source := `<template><div/></template>

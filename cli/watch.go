@@ -973,7 +973,10 @@ func canonicalPath(path string) string {
 	return filepath.Clean(path)
 }
 
-func buildFrameworkRegistry(cfg *config.Config) *framework.ProcessorRegistry {
+// buildFrameworkRegistry builds the per-project processors. projectRoot is the
+// absolute project directory: the indexer passes project-relative file paths,
+// and a workspace watcher's cwd is the workspace folder, not the project.
+func buildFrameworkRegistry(cfg *config.Config, projectRoot string) *framework.ProcessorRegistry {
 	regCfg := framework.RegistryConfig{
 		Enabled:      cfg.Framework.Enabled,
 		Mode:         cfg.Framework.Mode,
@@ -986,7 +989,7 @@ func buildFrameworkRegistry(cfg *config.Config) *framework.ProcessorRegistry {
 
 	return framework.NewProcessorRegistry(
 		regCfg,
-		framework.NewVueProcessor(cfg.Framework.NodePath),
+		framework.NewVueProcessor(cfg.Framework.NodePath, projectRoot),
 		&framework.SvelteProcessor{},
 		&framework.AstroProcessor{},
 		&framework.SolidProcessor{},
@@ -1099,7 +1102,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 
 	// Initialize chunker
 	chunker := indexer.NewChunker(cfg.Chunking.Size, cfg.Chunking.Overlap)
-	processorRegistry := buildFrameworkRegistry(cfg)
+	processorRegistry := buildFrameworkRegistry(cfg, projectRoot)
 
 	// Initialize indexer
 	idx := indexer.NewIndexer(projectRoot, st, emb, chunker, scanner, cfg.Watch.LastIndexTime, processorRegistry)
@@ -3082,7 +3085,7 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		WithCustomExtensions(ws.Chunking.CustomExtensions).
 		WithCustomExtensions(projectCfg.Chunking.CustomExtensions)
 	chunker := indexer.NewChunker(projectCfg.Chunking.Size, projectCfg.Chunking.Overlap)
-	processorRegistry := buildFrameworkRegistry(projectCfg)
+	processorRegistry := buildFrameworkRegistry(projectCfg, project.Path)
 	vectorStore := &projectPrefixStore{
 		store:         sharedStore,
 		workspaceName: ws.Name,

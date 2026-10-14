@@ -19,18 +19,44 @@ var vueProcessorScript string
 
 type VueProcessor struct {
 	nodePath string
-	mu       sync.RWMutex
-	// missing records directories whose ancestor chain has no
-	// @vue/compiler-sfc, keyed by directory. One project without the compiler
-	// must not switch off the compiler for sibling projects that have one.
-	missing map[string]string
+	// root is the project directory relative file paths belong to. The indexer
+	// hands over paths relative to the project root, and a workspace watcher
+	// serves many projects from one process whose cwd is the workspace folder,
+	// so resolution of @vue/compiler-sfc must start from root, never from cwd.
+	root string
+	mu   sync.RWMutex
+	// missing records absolute directories whose ancestor chain has no
+	// @vue/compiler-sfc. One project without the compiler must not switch off
+	// the compiler for sibling projects that have one.
+	missing map[string]struct{}
 }
 
-func NewVueProcessor(nodePath string) *VueProcessor {
+// NewVueProcessor builds a processor for one project. root is that project's
+// absolute directory; an empty root resolves relative paths against the
+// process cwd (tests and root-mode callers that pass absolute paths).
+func NewVueProcessor(nodePath, root string) *VueProcessor {
 	if nodePath == "" {
 		nodePath = "node"
 	}
-	return &VueProcessor{nodePath: nodePath}
+	if root != "" {
+		root = filepath.Clean(root)
+	}
+	return &VueProcessor{nodePath: nodePath, root: root}
+}
+
+// absolutePath is where the file lives on disk; filePath itself stays the
+// index identity (virtual path, warnings, symbol file names).
+func (p *VueProcessor) absolutePath(filePath string) string {
+	if filepath.IsAbs(filePath) {
+		return filepath.Clean(filePath)
+	}
+	if p.root != "" {
+		return filepath.Join(p.root, filePath)
+	}
+	if abs, err := filepath.Abs(filePath); err == nil {
+		return abs
+	}
+	return filepath.Clean(filePath)
 }
 
 func (p *VueProcessor) Name() string { return "vue" }
@@ -50,8 +76,9 @@ func (p *VueProcessor) TransformForTrace(ctx context.Context, filePath, source s
 }
 
 type vueScriptInput struct {
-	FilePath string `json:"filePath"`
-	Source   string `json:"source"`
+	FilePath    string `json:"filePath"`
+	Source      string `json:"source"`
+	ResolvePath string `json:"resolvePath"`
 }
 
 type vueScriptOutput struct {
@@ -63,12 +90,14 @@ type vueScriptOutput struct {
 }
 
 func (p *VueProcessor) transform(ctx context.Context, filePath, source string) (TransformResult, error) {
-	if msg, ok := p.missingCompilerMessage(filePath); ok {
+	absPath := p.absolutePath(filePath)
+	if msg, ok := p.missingCompilerMessage(absPath); ok {
 		return p.fallbackWithCompilerWarning(filePath, source, msg)
 	}
 
-	in, _ := json.Marshal(vueScriptInput{FilePath: filePath, Source: source})
+	in, _ := json.Marshal(vueScriptInput{FilePath: filePath, Source: source, ResolvePath: absPath})
 	cmd := exec.CommandContext(ctx, p.nodePath, "--input-type=module", "-e", vueProcessorScript) //nolint:gosec // nodePath is an executable path from trusted config; no shell is invoked
+	cmd.Dir = p.root
 	cmd.Stdin = bytes.NewReader(in)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -78,8 +107,8 @@ func (p *VueProcessor) transform(ctx context.Context, filePath, source string) (
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if isMissingVueCompiler(msg) {
-			msg = normalizeMissingVueCompilerMessage(filePath)
-			p.setMissingCompilerMessage(filePath, msg)
+			msg = normalizeMissingVueCompilerMessage(filepath.Dir(absPath))
+			p.setMissingCompiler(absPath)
 		}
 		fallback, fbErr := p.fallback(filePath, source)
 		if fbErr == nil {
@@ -131,43 +160,38 @@ func isMissingVueCompiler(msg string) bool {
 		(strings.Contains(msg, "Cannot find package") || strings.Contains(msg, "Cannot resolve @vue/compiler-sfc"))
 }
 
-func normalizeMissingVueCompilerMessage(filePath string) string {
-	return fmt.Sprintf("Cannot resolve @vue/compiler-sfc from %s; install it in the Vue workspace to enable full SFC compilation", pathDir(filePath))
+func normalizeMissingVueCompilerMessage(dir string) string {
+	return fmt.Sprintf("Cannot resolve @vue/compiler-sfc from %s; install it in the Vue workspace to enable full SFC compilation", dir)
 }
 
-func pathDir(filePath string) string {
-	lastSlash := strings.LastIndexAny(filePath, `/\`)
-	if lastSlash < 0 {
-		return "."
-	}
-	if lastSlash == 0 {
-		return filePath[:1]
-	}
-	return filePath[:lastSlash]
-}
-
-func (p *VueProcessor) missingCompilerMessage(filePath string) (string, bool) {
+// missingCompilerMessage reports whether absPath's directory is known to
+// have no @vue/compiler-sfc in its ancestor chain. absPath must be absolute.
+func (p *VueProcessor) missingCompilerMessage(absPath string) (string, bool) {
+	dir := filepath.Dir(absPath)
 	p.mu.RLock()
-	defer p.mu.RUnlock()
-	msg, ok := p.missing[filepath.Clean(pathDir(filePath))]
-	return msg, ok
+	_, ok := p.missing[dir]
+	p.mu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	return normalizeMissingVueCompilerMessage(dir), true
 }
 
-// setMissingCompilerMessage marks every directory the script's resolution
-// walked (the file's directory and its ancestors): none of them can resolve
-// the compiler, so files directly in any of them skip the node spawn. A
-// subdirectory may still carry its own node_modules and is not marked.
-func (p *VueProcessor) setMissingCompilerMessage(filePath, msg string) {
+// setMissingCompiler marks every directory the script's resolution walked
+// (the file's directory and its ancestors): none of them can resolve the
+// compiler, so files directly in any of them skip the node spawn. A
+// subdirectory may still carry its own node_modules and is not marked. Marks
+// last for the processor's lifetime (a watcher restart after installing the
+// compiler).
+func (p *VueProcessor) setMissingCompiler(absPath string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.missing == nil {
-		p.missing = make(map[string]string)
+		p.missing = make(map[string]struct{})
 	}
-	dir := filepath.Clean(pathDir(filePath))
+	dir := filepath.Dir(absPath)
 	for {
-		if _, seen := p.missing[dir]; !seen {
-			p.missing[dir] = msg
-		}
+		p.missing[dir] = struct{}{}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			return

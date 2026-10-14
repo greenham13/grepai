@@ -110,7 +110,7 @@ func TestRegistryRequireFailsForScaffoldProcessor(t *testing.T) {
 }
 
 func TestVueProcessorFallbackWithMissingNode(t *testing.T) {
-	p := NewVueProcessor("node-does-not-exist")
+	p := NewVueProcessor("node-does-not-exist", "")
 	r := NewProcessorRegistry(RegistryConfig{Enabled: true, Mode: ModeAuto, EnableVue: true}, p)
 
 	source := `<template><div>{{ n }}</div></template>\n<script setup lang="ts">\nconst n = 1\n</script>`

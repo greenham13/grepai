@@ -9,7 +9,7 @@ import (
 )
 
 func TestVueProcessorFallback_ExtractsScriptBlocksAndMapsLines(t *testing.T) {
-	p := NewVueProcessor("node")
+	p := NewVueProcessor("node", "")
 	source := `<template><div>Hello</div></template>
 
 <script lang="ts">
@@ -120,7 +120,7 @@ export function compileTemplate() {
 		t.Fatalf("write compiler module: %v", err)
 	}
 
-	p := NewVueProcessor("node")
+	p := NewVueProcessor("node", "")
 	res, err := p.TransformForEmbedding(context.Background(), componentPath, "<template><div/></template>")
 	if err != nil {
 		t.Fatalf("transform failed: %v", err)
