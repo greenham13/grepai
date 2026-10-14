@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	ignore "github.com/sabhiram/go-gitignore"
 )
@@ -49,6 +50,17 @@ type IgnoreMatcher struct {
 	extraDirs          []string        // patterns from config
 	grepaiMatchers     []grepaiMatcher // .grepaiignore matchers
 	hasGrepaiNegations bool            // true if any .grepaiignore has ! patterns
+
+	// Hard exclusions: config ignore and the external gitignore. Only the
+	// root .grepaiignore may re-include what they exclude; nested
+	// .grepaiignore files cannot (a repo's "!*" would otherwise undo them).
+	extraMatcher     *ignore.GitIgnore
+	externalMatcher  *ignore.GitIgnore
+	rootGrepai       *grepaiMatcher
+	hasRootNegations bool
+
+	hardDirMu    sync.Mutex
+	hardDirCache map[string]bool
 }
 
 func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignore string) (*IgnoreMatcher, error) {
@@ -68,11 +80,16 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 				log.Printf("Warning: failed to load external gitignore: %v", err)
 			}
 		} else {
+			m.externalMatcher = gi
 			m.nestedMatchers = append(m.nestedMatchers, nestedMatcher{
 				matcher: gi,
 				baseDir: "", // External gitignore applies from root
 			})
 		}
+	}
+
+	if len(extraIgnore) > 0 {
+		m.extraMatcher = ignore.CompileIgnoreLines(extraIgnore...)
 	}
 
 	// Walk the project to find all .gitignore and .grepaiignore files
@@ -87,6 +104,16 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 			for _, dir := range extraIgnore {
 				if base == dir {
 					return filepath.SkipDir
+				}
+			}
+			// Wildcard config entries ("*-worktree-*") prune too, so rule
+			// files inside an excluded folder are never loaded.
+			if m.extraMatcher != nil && path != projectRoot {
+				if rel, relErr := filepath.Rel(projectRoot, path); relErr == nil {
+					rel = filepath.ToSlash(rel)
+					if m.extraMatcher.MatchesPath(rel) || m.extraMatcher.MatchesPath(rel+"/") {
+						return filepath.SkipDir
+					}
 				}
 			}
 			return nil
@@ -134,6 +161,9 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 			m.grepaiMatchers = append(m.grepaiMatchers, gm)
 			if hasNegations {
 				m.hasGrepaiNegations = true
+				if relPath == "" {
+					m.hasRootNegations = true
+				}
 			}
 		}
 
@@ -153,6 +183,12 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 		})
 	}
 
+	for i := range m.grepaiMatchers {
+		if m.grepaiMatchers[i].baseDir == "" {
+			m.rootGrepai = &m.grepaiMatchers[i]
+		}
+	}
+
 	return m, nil
 }
 
@@ -165,6 +201,10 @@ func (m *IgnoreMatcher) ShouldIgnore(path string) bool {
 	}
 
 	normalizedPath := filepath.ToSlash(path)
+
+	if m.hardExcluded(normalizedPath) {
+		return true
+	}
 
 	// Phase 1: Check if .grepaiignore has an opinion
 	result, hasOpinion, grepaiBaseDir := m.evalGrepaiIgnore(normalizedPath)
@@ -195,6 +235,12 @@ func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 
 	normalizedPath := filepath.ToSlash(path)
 
+	// Nothing below a hard-excluded dir can come back unless the root
+	// .grepaiignore re-includes something.
+	if !m.hasRootNegations && m.hardExcluded(normalizedPath) {
+		return true
+	}
+
 	// If .grepaiignore explicitly says to ignore this dir → safe to skip
 	if result, hasOpinion, _ := m.evalGrepaiIgnore(normalizedPath); hasOpinion {
 		return result
@@ -222,6 +268,9 @@ func (m *IgnoreMatcher) evalGrepaiIgnore(normalizedPath string) (bool, bool, str
 		if relPath == "" && gm.baseDir != "" {
 			continue // This matcher doesn't apply to this path
 		}
+		if relPath == "." {
+			continue // A .grepaiignore rules its contents, not its own folder
+		}
 
 		// Check if the "any" matcher detects this path (any pattern matches, positive or negative)
 		if gm.any.MatchesPath(relPath) || gm.any.MatchesPath(relPath+"/") {
@@ -248,6 +297,88 @@ func (m *IgnoreMatcher) evalGrepaiIgnore(normalizedPath string) (bool, bool, str
 		return false, true, bestMatch.baseDir
 	}
 	return matchPlain || matchSlash, true, bestMatch.baseDir
+}
+
+// hardExcluded reports whether the path, or a folder above it, is excluded by
+// a rule that nested .grepaiignore files cannot override: config ignore, the
+// external gitignore, or a root .grepaiignore exclusion of a parent folder.
+// A root .grepaiignore negation that matches the path itself still wins, as
+// documented upstream.
+func (m *IgnoreMatcher) hardExcluded(normalizedPath string) bool {
+	if m.extraMatcher == nil && m.externalMatcher == nil && m.rootGrepai == nil {
+		return false
+	}
+	if result, opinion := m.rootGrepaiDecision(normalizedPath); opinion && !result {
+		return false
+	}
+	for i := 0; i < len(normalizedPath); i++ {
+		if normalizedPath[i] == '/' && m.hardDir(normalizedPath[:i]) {
+			return true
+		}
+	}
+	// The path itself: only config/external. A root .grepaiignore match on
+	// the path keeps upstream's nested-override behaviour (phase 1).
+	return m.configOrExternal(normalizedPath)
+}
+
+func (m *IgnoreMatcher) configOrExternal(p string) bool {
+	if matchesEither(m.extraMatcher, p) || matchesEither(m.externalMatcher, p) {
+		return true
+	}
+	base := filepath.Base(p)
+	for _, dir := range m.extraDirs {
+		if base == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// hardDir reports whether a parent folder is hard-excluded. The root
+// .grepaiignore decides first; otherwise config ignore and the external
+// gitignore do.
+func (m *IgnoreMatcher) hardDir(p string) bool {
+	m.hardDirMu.Lock()
+	cached, ok := m.hardDirCache[p]
+	m.hardDirMu.Unlock()
+	if ok {
+		return cached
+	}
+	var hard bool
+	if result, opinion := m.rootGrepaiDecision(p); opinion {
+		hard = result
+	} else {
+		hard = m.configOrExternal(p)
+	}
+	m.hardDirMu.Lock()
+	if m.hardDirCache == nil {
+		m.hardDirCache = make(map[string]bool)
+	}
+	m.hardDirCache[p] = hard
+	m.hardDirMu.Unlock()
+	return hard
+}
+
+// rootGrepaiDecision evaluates only the root .grepaiignore, with the same
+// plain/trailing-slash rule as evalGrepaiIgnore.
+func (m *IgnoreMatcher) rootGrepaiDecision(p string) (bool, bool) {
+	gm := m.rootGrepai
+	if gm == nil {
+		return false, false
+	}
+	if !gm.any.MatchesPath(p) && !gm.any.MatchesPath(p+"/") {
+		return false, false
+	}
+	matchPlain := gm.full.MatchesPath(p)
+	matchSlash := gm.full.MatchesPath(p + "/")
+	if matchPlain && !matchSlash {
+		return false, true
+	}
+	return matchPlain || matchSlash, true
+}
+
+func matchesEither(gi *ignore.GitIgnore, p string) bool {
+	return gi != nil && (gi.MatchesPath(p) || gi.MatchesPath(p+"/"))
 }
 
 // evalGitIgnore checks extra dirs and .gitignore matchers (original ShouldIgnore logic).
