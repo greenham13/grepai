@@ -230,7 +230,7 @@ func TestAutoInitWorktreeSerializesCompleteSeedCopy(t *testing.T) {
 }
 
 func TestAutoInitWorktreeRollsBackEveryFailedCopyStage(t *testing.T) {
-	for _, stage := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+	for _, stage := range []string{"index.gob", "symbols.gob", "symbols.gob.log", "config.yaml"} {
 		t.Run(stage, func(t *testing.T) {
 			mainDir := t.TempDir()
 			worktreeDir := t.TempDir()
@@ -238,7 +238,7 @@ func TestAutoInitWorktreeRollsBackEveryFailedCopyStage(t *testing.T) {
 			if err := os.MkdirAll(mainGrepai, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			for name, data := range map[string]string{"index.gob": "index", "symbols.gob": "symbols", "config.yaml": "version: 1\n"} {
+			for name, data := range map[string]string{"index.gob": "index", "symbols.gob": "symbols", "symbols.gob.log": "log", "config.yaml": "version: 1\n"} {
 				if err := os.WriteFile(filepath.Join(mainGrepai, name), []byte(data), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -258,7 +258,7 @@ func TestAutoInitWorktreeRollsBackEveryFailedCopyStage(t *testing.T) {
 			if projectConfigIsValid(worktreeDir) {
 				t.Fatal("failed auto-init published a valid completion marker")
 			}
-			for _, name := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+			for _, name := range []string{"index.gob", "symbols.gob", "symbols.gob.log", "config.yaml"} {
 				if _, err := os.Stat(filepath.Join(worktreeDir, ".grepai", name)); !os.IsNotExist(err) {
 					t.Fatalf("failed auto-init left %s: %v", name, err)
 				}

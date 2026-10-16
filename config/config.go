@@ -820,6 +820,15 @@ func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFil
 		cleanup()
 		return err
 	}
+	// The change log carries the base's newer files. A log copied across a
+	// concurrent compaction names another base and is ignored on load.
+	dstSymbolLog := dstSymbols + ".log"
+	created = append(created, dstSymbolLog)
+	_ = os.Remove(dstSymbolLog)
+	if err := copyFile(filepath.Join(mainGrepai, "symbols.gob.log"), dstSymbolLog); err != nil {
+		cleanup()
+		return err
+	}
 
 	// Copy required config last so its presence means every seed copy finished.
 	srcConfig := filepath.Join(mainGrepai, "config.yaml")

@@ -344,3 +344,86 @@ func TestReconciliationFailedWalkKeepsQueueMoving(t *testing.T) {
 		t.Fatalf("walks=%d", calls)
 	}
 }
+
+// A store from a release that did not record extractor versions makes the
+// first reconcile re-extract every unchanged file. That backfill must not
+// rewrite symbols.gob, and a reconcile with nothing to do must write nothing.
+func TestReconcileVersionBackfillDoesNotRewriteSymbolIndex(t *testing.T) {
+	r, _, _ := reconcileRuntimeFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	root := r.project.Path
+	symbolPath := config.GetSymbolIndexPath(root)
+
+	file, err := r.scanner.ScanFile("main.go")
+	if err != nil || file == nil {
+		t.Fatalf("scan: %v", err)
+	}
+	symbols, refs, err := extractSymbolsWithFramework(ctx, r.extractor, file.Path, file.Content, r.processor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := trace.NewGOBSymbolStore(symbolPath)
+	if err := legacy.SaveFileWithContentHash(ctx, file.Path, file.Hash, symbols, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.symbolStore.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(symbolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	writer := startWorkspaceProjectWriter(ctx, newWatchMutationFence(), r)
+	defer func() { cancel(); <-writer.done }()
+	reconcile := func(step string) {
+		t.Helper()
+		result := make(chan error, 1)
+		go func() { result <- reconcileWorkspaceProject(ctx, r) }()
+		if err := awaitWatchTestValue(t, result, step); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reconcile("backfill reconcile")
+	if v, ok := r.symbolStore.GetFileExtractorVersion("main.go"); !ok || v != r.extractor.Version() {
+		t.Fatalf("version not backfilled: %q %v", v, ok)
+	}
+	after, err := os.Stat(symbolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatal("version backfill rewrote symbols.gob")
+	}
+
+	logPath := symbolPath + ".log"
+	logBefore, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatalf("backfill was not persisted to the log: %v", err)
+	}
+	reconcile("idle reconcile")
+	after, err = os.Stat(symbolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logAfter, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) ||
+		logAfter.Size() != logBefore.Size() || !logAfter.ModTime().Equal(logBefore.ModTime()) {
+		t.Fatal("reconcile of an unchanged project wrote the symbol index")
+	}
+
+	reloaded := trace.NewGOBSymbolStore(symbolPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := reloaded.GetFileExtractorVersion("main.go"); !ok || v != r.extractor.Version() {
+		t.Fatalf("backfilled version lost on reload: %q %v", v, ok)
+	}
+}

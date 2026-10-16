@@ -2,10 +2,13 @@ package trace
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,16 +16,63 @@ import (
 )
 
 // GOBSymbolStore implements SymbolStore using GOB encoding.
+//
+// On disk the store is a base snapshot (symbols.gob, the format every grepai
+// release reads) plus an append-only change log (symbols.gob.log, see
+// store_log.go). Persist appends the files that changed since the last
+// persist to the log and rewrites the base only when the log has grown past
+// a fraction of the base, so a one-file change no longer rewrites the whole
+// snapshot.
+//
+// In memory every symbol, reference and call edge is grouped by the file
+// named in its File field, and each file remembers which names it
+// contributed. Replacing or deleting a file therefore touches only that
+// file's entries, not the whole store.
 type GOBSymbolStore struct {
-	indexPath                 string
-	lockPath                  string
-	index                     *SymbolIndex
-	fileIndex                 map[string]bool
-	fileContentHashes         map[string]string
-	fileExtractorVersions     map[string]string
+	indexPath string
+	lockPath  string
+	logPath   string
+
+	symbols      map[string]map[string][]Symbol    // name -> file -> symbols
+	refs         map[string]map[string][]Reference // symbol name -> file -> references
+	edges        map[string][]CallEdge             // file -> call edges
+	fileSymNames map[string][]string               // file -> distinct symbol names it defines
+	fileRefNames map[string][]string               // file -> distinct names it references
+	totalSymbols int
+	totalRefs    int
+	updatedAt    time.Time
+	version      int
+
+	fileIndex             map[string]bool
+	fileContentHashes     map[string]string
+	fileExtractorVersions map[string]string
+
 	constructorPersistPending bool
 	mutationGeneration        uint64
-	mu                        sync.RWMutex
+	// dirty maps a file to true when its entries changed and false when
+	// only its hash/version metadata changed since the last persist.
+	dirty map[string]bool
+
+	// logID ties the change log to the base it extends. Empty means the
+	// base on disk (if any) has no log identity and the next persist must
+	// rewrite it.
+	logID string
+	// logSize is the length of the valid log prefix; 0 means the log must
+	// be (re)created with a fresh header before the next append.
+	logSize int64
+	// baseStamp identifies the base file this store last read or wrote, so
+	// a base replaced by another process is never extended with our log.
+	baseStamp fileStamp
+
+	// removalVisits counts entries examined while removing file groups.
+	// It exists so tests can prove a per-file update stays per-file.
+	removalVisits uint64
+
+	edgeCacheMu    sync.Mutex
+	edgeCache      []CallEdge
+	edgeCacheValid bool
+
+	mu sync.RWMutex
 }
 
 type gobSymbolData struct {
@@ -38,24 +88,58 @@ type gobSymbolData struct {
 	// "extractor version unknown" and re-extracts once, which is the
 	// correct behavior for a one-time upgrade.
 	FileExtractorVersions map[string]string
+	// LogID names the change log that extends this base. Releases that do
+	// not know the field ignore it on decode and drop it on write, which
+	// orphans the log: a log whose header does not match is never replayed.
+	LogID string
+}
+
+type fileStamp struct {
+	size    int64
+	modTime time.Time
+	valid   bool
+}
+
+func statStamp(info os.FileInfo) fileStamp {
+	return fileStamp{size: info.Size(), modTime: info.ModTime(), valid: true}
 }
 
 // NewGOBSymbolStore creates a new GOB-based symbol store.
 func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
-	return &GOBSymbolStore{
-		indexPath: indexPath,
-		lockPath:  indexPath + ".lock",
-		index: &SymbolIndex{
-			Symbols:    make(map[string][]Symbol),
-			References: make(map[string][]Reference),
-			CallGraph:  []CallEdge{},
-			Version:    1,
-		},
-		fileIndex:                 make(map[string]bool),
-		fileContentHashes:         make(map[string]string),
-		fileExtractorVersions:     make(map[string]string),
+	s := &GOBSymbolStore{
+		indexPath:                 indexPath,
+		lockPath:                  indexPath + ".lock",
+		logPath:                   indexPath + ".log",
 		constructorPersistPending: true,
 	}
+	s.resetUnlocked()
+	return s
+}
+
+func (s *GOBSymbolStore) resetUnlocked() {
+	s.symbols = make(map[string]map[string][]Symbol)
+	s.refs = make(map[string]map[string][]Reference)
+	s.edges = make(map[string][]CallEdge)
+	s.fileSymNames = make(map[string][]string)
+	s.fileRefNames = make(map[string][]string)
+	s.totalSymbols = 0
+	s.totalRefs = 0
+	s.updatedAt = time.Time{}
+	s.version = 1
+	s.fileIndex = make(map[string]bool)
+	s.fileContentHashes = make(map[string]string)
+	s.fileExtractorVersions = make(map[string]string)
+	s.dirty = make(map[string]bool)
+	s.logID = ""
+	s.logSize = 0
+	s.baseStamp = fileStamp{}
+	s.invalidateEdgeCache()
+}
+
+// invalidateEdgeCache must be called with s.mu held for writing.
+func (s *GOBSymbolStore) invalidateEdgeCache() {
+	s.edgeCache = nil
+	s.edgeCacheValid = false
 }
 
 // Load reads the index from storage.
@@ -99,44 +183,91 @@ func (s *GOBSymbolStore) loadUnlocked() (bool, error) {
 		return false, fmt.Errorf("failed to open symbol index: %w", err)
 	}
 	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, fmt.Errorf("failed to stat symbol index: %w", err)
+	}
 
 	var data gobSymbolData
 	if err := gob.NewDecoder(file).Decode(&data); err != nil {
 		return false, fmt.Errorf("failed to decode symbol index: %w", err)
 	}
 
-	s.index = &data.Index
-	s.fileIndex = data.FileIndex
-	s.fileContentHashes = data.FileContentHashes
-	s.fileExtractorVersions = data.FileExtractorVersions
-
-	if s.index.Symbols == nil {
-		s.index.Symbols = make(map[string][]Symbol)
+	s.resetUnlocked()
+	s.applyBaseUnlocked(&data)
+	s.baseStamp = statStamp(info)
+	s.logID = data.LogID
+	if s.logID != "" {
+		if err := s.replayLogUnlocked(); err != nil {
+			return false, err
+		}
 	}
-	if s.index.References == nil {
-		s.index.References = make(map[string][]Reference)
-	}
-	if s.index.CallGraph == nil {
-		s.index.CallGraph = []CallEdge{}
-	}
-	if s.fileIndex == nil {
-		s.fileIndex = make(map[string]bool)
-	}
-	if s.fileContentHashes == nil {
-		s.fileContentHashes = make(map[string]string)
-	}
-	if s.fileExtractorVersions == nil {
-		s.fileExtractorVersions = make(map[string]string)
-	}
-
 	return true, nil
+}
+
+// applyBaseUnlocked distributes a decoded snapshot into per-file groups.
+func (s *GOBSymbolStore) applyBaseUnlocked(data *gobSymbolData) {
+	for name, list := range data.Index.Symbols {
+		for _, sym := range list {
+			s.appendSymbolUnlocked(name, sym)
+		}
+	}
+	for name, list := range data.Index.References {
+		for _, ref := range list {
+			s.appendRefUnlocked(name, ref)
+		}
+	}
+	for _, edge := range data.Index.CallGraph {
+		s.edges[edge.File] = append(s.edges[edge.File], edge)
+	}
+	s.updatedAt = data.Index.UpdatedAt
+	if data.Index.Version != 0 {
+		s.version = data.Index.Version
+	}
+	if data.FileIndex != nil {
+		s.fileIndex = data.FileIndex
+	}
+	if data.FileContentHashes != nil {
+		s.fileContentHashes = data.FileContentHashes
+	}
+	if data.FileExtractorVersions != nil {
+		s.fileExtractorVersions = data.FileExtractorVersions
+	}
+}
+
+func (s *GOBSymbolStore) appendSymbolUnlocked(name string, sym Symbol) {
+	byFile := s.symbols[name]
+	if byFile == nil {
+		byFile = make(map[string][]Symbol)
+		s.symbols[name] = byFile
+	}
+	list, ok := byFile[sym.File]
+	if !ok {
+		s.fileSymNames[sym.File] = append(s.fileSymNames[sym.File], name)
+	}
+	byFile[sym.File] = append(list, sym)
+	s.totalSymbols++
+}
+
+func (s *GOBSymbolStore) appendRefUnlocked(name string, ref Reference) {
+	byFile := s.refs[name]
+	if byFile == nil {
+		byFile = make(map[string][]Reference)
+		s.refs[name] = byFile
+	}
+	list, ok := byFile[ref.File]
+	if !ok {
+		s.fileRefNames[ref.File] = append(s.fileRefNames[ref.File], name)
+	}
+	byFile[ref.File] = append(list, ref)
+	s.totalRefs++
 }
 
 // Persist writes the index to storage.
 func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.constructorPersistPending && s.mutationGeneration == 0 {
+	if !s.constructorPersistPending && len(s.dirty) == 0 {
 		return nil
 	}
 
@@ -160,12 +291,65 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 }
 
 func (s *GOBSymbolStore) persistUnlocked() error {
-	s.index.UpdatedAt = time.Now()
+	now := time.Now()
+	if s.canAppendUnlocked() {
+		batch, err := s.encodeDirtyBatchUnlocked(now)
+		if err != nil {
+			return err
+		}
+		if !s.logTooLargeUnlocked(int64(len(batch))) {
+			if err := s.appendLogUnlocked(batch); err != nil {
+				return err
+			}
+			s.updatedAt = now
+			s.finishPersistUnlocked()
+			return nil
+		}
+	}
+	return s.compactUnlocked(now)
+}
+
+// canAppendUnlocked reports whether the base on disk is the one our log
+// extends. Anything else -- a fresh store, a base from a release without
+// log support, a base replaced or removed by another process -- needs a
+// full rewrite.
+func (s *GOBSymbolStore) canAppendUnlocked() bool {
+	if s.constructorPersistPending || s.logID == "" || !s.baseStamp.valid {
+		return false
+	}
+	info, err := os.Stat(s.indexPath)
+	if err != nil {
+		return false
+	}
+	current := statStamp(info)
+	return current.size == s.baseStamp.size && current.modTime.Equal(s.baseStamp.modTime)
+}
+
+func (s *GOBSymbolStore) finishPersistUnlocked() {
+	s.constructorPersistPending = false
+	s.mutationGeneration = 0
+	s.dirty = make(map[string]bool)
+}
+
+// compactUnlocked rewrites the base snapshot with a new log identity and
+// drops the log it supersedes.
+func (s *GOBSymbolStore) compactUnlocked(now time.Time) error {
+	logID, err := newLogID()
+	if err != nil {
+		return err
+	}
 	data := gobSymbolData{
-		Index:                 *s.index,
+		Index: SymbolIndex{
+			Symbols:    s.flatSymbolsUnlocked(),
+			References: s.flatRefsUnlocked(),
+			CallGraph:  s.allEdgesLocked(),
+			UpdatedAt:  now,
+			Version:    s.version,
+		},
 		FileIndex:             s.fileIndex,
 		FileContentHashes:     s.fileContentHashes,
 		FileExtractorVersions: s.fileExtractorVersions,
+		LogID:                 logID,
 	}
 
 	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
@@ -196,10 +380,96 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 		return fmt.Errorf("failed to replace symbol index file: %w", err)
 	}
 	cleanupTemp = false
-	s.constructorPersistPending = false
-	s.mutationGeneration = 0
-
+	info, err := os.Stat(s.indexPath)
+	if err != nil {
+		// The new base is in place; without its stamp the next persist
+		// rewrites it again rather than extending it blindly.
+		s.baseStamp = fileStamp{}
+	} else {
+		s.baseStamp = statStamp(info)
+	}
+	s.logID = logID
+	// The old log names the previous base, so it can never be replayed on
+	// this one. Removing it only reclaims space; if removal fails the next
+	// append truncates it (logSize 0 forces a fresh header).
+	_ = os.Remove(s.logPath)
+	s.logSize = 0
+	s.updatedAt = now
+	s.finishPersistUnlocked()
 	return nil
+}
+
+func newLogID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("failed to create symbol log id: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// flatSymbolsUnlocked builds the snapshot's name -> symbols map with files
+// in sorted order, so the base is deterministic for identical content.
+func (s *GOBSymbolStore) flatSymbolsUnlocked() map[string][]Symbol {
+	out := make(map[string][]Symbol, len(s.symbols))
+	for name, byFile := range s.symbols {
+		out[name] = flattenByFile(byFile)
+	}
+	return out
+}
+
+func (s *GOBSymbolStore) flatRefsUnlocked() map[string][]Reference {
+	out := make(map[string][]Reference, len(s.refs))
+	for name, byFile := range s.refs {
+		out[name] = flattenByFile(byFile)
+	}
+	return out
+}
+
+// flattenByFile concatenates per-file groups in file order. A single group
+// is returned as is; callers that hand the result out must copy it.
+func flattenByFile[T any](byFile map[string][]T) []T {
+	if len(byFile) == 1 {
+		for _, list := range byFile {
+			return list
+		}
+	}
+	files := make([]string, 0, len(byFile))
+	total := 0
+	for file, list := range byFile {
+		files = append(files, file)
+		total += len(list)
+	}
+	sort.Strings(files)
+	out := make([]T, 0, total)
+	for _, file := range files {
+		out = append(out, byFile[file]...)
+	}
+	return out
+}
+
+// allEdgesLocked returns every call edge, grouped by file in sorted order.
+// The caller holds s.mu for reading or writing; the result is shared and
+// must not be modified.
+func (s *GOBSymbolStore) allEdgesLocked() []CallEdge {
+	s.edgeCacheMu.Lock()
+	defer s.edgeCacheMu.Unlock()
+	if s.edgeCacheValid {
+		return s.edgeCache
+	}
+	files := make([]string, 0, len(s.edges))
+	total := 0
+	for file, list := range s.edges {
+		files = append(files, file)
+		total += len(list)
+	}
+	sort.Strings(files)
+	all := make([]CallEdge, 0, total)
+	for _, file := range files {
+		all = append(all, s.edges[file]...)
+	}
+	s.edgeCache = all
+	s.edgeCacheValid = true
+	return all
 }
 
 // SaveFile persists symbols and references for a file.
@@ -214,44 +484,8 @@ func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols 
 func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.mutationGeneration++
-	s.saveFileWithContentHashUnlocked(filePath, contentHash, symbols, refs)
+	s.saveFileUnlocked(filePath, contentHash, symbols, refs)
 	return nil
-}
-
-func (s *GOBSymbolStore) saveFileWithContentHashUnlocked(filePath string, contentHash string, symbols []Symbol, refs []Reference) {
-	// Remove old entries for this file first
-	s.deleteFileUnlocked(filePath)
-
-	// Add new symbols
-	for _, sym := range symbols {
-		s.index.Symbols[sym.Name] = append(s.index.Symbols[sym.Name], sym)
-	}
-
-	// Add new references
-	for _, ref := range refs {
-		s.index.References[ref.SymbolName] = append(s.index.References[ref.SymbolName], ref)
-	}
-
-	// Build call graph edges
-	for _, ref := range refs {
-		if ref.CallerName != "" && ref.CallerName != "<top-level>" {
-			s.index.CallGraph = append(s.index.CallGraph, CallEdge{
-				Caller:   ref.CallerName,
-				Callee:   ref.SymbolName,
-				File:     ref.File,
-				Line:     ref.Line,
-				CallType: "direct",
-			})
-		}
-	}
-
-	s.fileIndex[filePath] = true
-	if contentHash != "" {
-		s.fileContentHashes[filePath] = contentHash
-	} else {
-		delete(s.fileContentHashes, filePath)
-	}
 }
 
 // SaveFileWithSignature persists symbols/references for a file and
@@ -261,77 +495,195 @@ func (s *GOBSymbolStore) saveFileWithContentHashUnlocked(filePath string, conten
 func (s *GOBSymbolStore) SaveFileWithSignature(ctx context.Context, filePath string, contentHash, extractorVersion string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.mutationGeneration++
-	s.saveFileWithContentHashUnlocked(filePath, contentHash, symbols, refs)
+	s.saveFileUnlocked(filePath, contentHash, symbols, refs)
+	current, ok := s.fileExtractorVersions[filePath]
 	if extractorVersion != "" {
-		s.fileExtractorVersions[filePath] = extractorVersion
-	} else {
+		if !ok || current != extractorVersion {
+			s.fileExtractorVersions[filePath] = extractorVersion
+			s.markDirtyUnlocked(filePath, false)
+		}
+	} else if ok {
 		delete(s.fileExtractorVersions, filePath)
+		s.markDirtyUnlocked(filePath, false)
 	}
 	return nil
+}
+
+// markDirtyUnlocked records that file changed; entries=true means its
+// symbols/references/edges changed, not only its metadata.
+func (s *GOBSymbolStore) markDirtyUnlocked(file string, entries bool) {
+	s.mutationGeneration++
+	s.dirty[file] = entries || s.dirty[file]
+}
+
+func (s *GOBSymbolStore) saveFileUnlocked(filePath, contentHash string, symbols []Symbol, refs []Reference) {
+	if s.fileIndex[filePath] && s.sameEntriesUnlocked(filePath, symbols, refs) {
+		// Re-extraction produced exactly what is stored: only the hash
+		// can differ. Nothing else is touched, so nothing is persisted.
+		current, ok := s.fileContentHashes[filePath]
+		switch {
+		case contentHash != "" && (!ok || current != contentHash):
+			s.fileContentHashes[filePath] = contentHash
+			s.markDirtyUnlocked(filePath, false)
+		case contentHash == "" && ok:
+			delete(s.fileContentHashes, filePath)
+			s.markDirtyUnlocked(filePath, false)
+		}
+		return
+	}
+
+	// Remove old entries for this file first.
+	s.removeEntriesUnlocked(filePath)
+
+	for _, sym := range symbols {
+		s.appendSymbolUnlocked(sym.Name, sym)
+		if sym.File != filePath {
+			s.dirty[sym.File] = true
+		}
+	}
+	for _, ref := range refs {
+		s.appendRefUnlocked(ref.SymbolName, ref)
+		if ref.File != filePath {
+			s.dirty[ref.File] = true
+		}
+	}
+	for _, edge := range edgesFromRefs(refs) {
+		s.edges[edge.File] = append(s.edges[edge.File], edge)
+	}
+
+	s.fileIndex[filePath] = true
+	if contentHash != "" {
+		s.fileContentHashes[filePath] = contentHash
+	} else {
+		delete(s.fileContentHashes, filePath)
+	}
+	s.invalidateEdgeCache()
+	s.markDirtyUnlocked(filePath, true)
+}
+
+func edgesFromRefs(refs []Reference) []CallEdge {
+	var edges []CallEdge
+	for _, ref := range refs {
+		if ref.CallerName != "" && ref.CallerName != "<top-level>" {
+			edges = append(edges, CallEdge{
+				Caller:   ref.CallerName,
+				Callee:   ref.SymbolName,
+				File:     ref.File,
+				Line:     ref.Line,
+				CallType: "direct",
+			})
+		}
+	}
+	return edges
+}
+
+// sameEntriesUnlocked reports whether saving symbols/refs for filePath would
+// leave the store's entries exactly as they are.
+func (s *GOBSymbolStore) sameEntriesUnlocked(filePath string, symbols []Symbol, refs []Reference) bool {
+	symGroups := make(map[string]int, len(s.fileSymNames[filePath]))
+	for _, sym := range symbols {
+		if sym.File != filePath {
+			return false
+		}
+		symGroups[sym.Name]++
+	}
+	if len(symGroups) != len(s.fileSymNames[filePath]) {
+		return false
+	}
+	refGroups := make(map[string]int, len(s.fileRefNames[filePath]))
+	for _, ref := range refs {
+		if ref.File != filePath {
+			return false
+		}
+		refGroups[ref.SymbolName]++
+	}
+	if len(refGroups) != len(s.fileRefNames[filePath]) {
+		return false
+	}
+	// Walk the input in order; each name's stored group must match the
+	// input's subsequence for that name element by element.
+	seen := make(map[string]int, len(symGroups))
+	for _, sym := range symbols {
+		stored := s.symbols[sym.Name][filePath]
+		i := seen[sym.Name]
+		if len(stored) != symGroups[sym.Name] || stored[i] != sym {
+			return false
+		}
+		seen[sym.Name] = i + 1
+	}
+	clear(seen)
+	for _, ref := range refs {
+		stored := s.refs[ref.SymbolName][filePath]
+		i := seen[ref.SymbolName]
+		if len(stored) != refGroups[ref.SymbolName] || stored[i] != ref {
+			return false
+		}
+		seen[ref.SymbolName] = i + 1
+	}
+	want := edgesFromRefs(refs)
+	have := s.edges[filePath]
+	if len(want) != len(have) {
+		return false
+	}
+	for i := range want {
+		if want[i] != have[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteFile removes all symbols and references for a file.
 func (s *GOBSymbolStore) DeleteFile(ctx context.Context, filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	removed := s.deleteFileUnlocked(filePath)
+	removed := s.removeEntriesUnlocked(filePath)
 	if _, ok := s.fileExtractorVersions[filePath]; ok {
 		delete(s.fileExtractorVersions, filePath)
 		removed = true
 	}
 	if removed {
-		s.mutationGeneration++
+		s.markDirtyUnlocked(filePath, true)
 	}
 	return nil
 }
 
-func (s *GOBSymbolStore) deleteFileUnlocked(filePath string) bool {
+// removeEntriesUnlocked drops every entry whose File is filePath plus the
+// file's indexed flag and content hash. It touches only that file's groups.
+func (s *GOBSymbolStore) removeEntriesUnlocked(filePath string) bool {
 	removed := false
-	// Remove symbols from this file
-	for name, symbols := range s.index.Symbols {
-		filtered := make([]Symbol, 0, len(symbols))
-		for _, sym := range symbols {
-			if sym.File != filePath {
-				filtered = append(filtered, sym)
-			} else {
-				removed = true
-			}
+	for _, name := range s.fileSymNames[filePath] {
+		byFile := s.symbols[name]
+		n := len(byFile[filePath])
+		s.removalVisits += uint64(n)
+		s.totalSymbols -= n
+		delete(byFile, filePath)
+		if len(byFile) == 0 {
+			delete(s.symbols, name)
 		}
-		if len(filtered) == 0 {
-			delete(s.index.Symbols, name)
-		} else {
-			s.index.Symbols[name] = filtered
-		}
+		removed = true
 	}
+	delete(s.fileSymNames, filePath)
 
-	// Remove references from this file
-	for name, refs := range s.index.References {
-		filtered := make([]Reference, 0, len(refs))
-		for _, ref := range refs {
-			if ref.File != filePath {
-				filtered = append(filtered, ref)
-			} else {
-				removed = true
-			}
+	for _, name := range s.fileRefNames[filePath] {
+		byFile := s.refs[name]
+		n := len(byFile[filePath])
+		s.removalVisits += uint64(n)
+		s.totalRefs -= n
+		delete(byFile, filePath)
+		if len(byFile) == 0 {
+			delete(s.refs, name)
 		}
-		if len(filtered) == 0 {
-			delete(s.index.References, name)
-		} else {
-			s.index.References[name] = filtered
-		}
+		removed = true
 	}
+	delete(s.fileRefNames, filePath)
 
-	// Remove call graph edges from this file
-	filtered := make([]CallEdge, 0, len(s.index.CallGraph))
-	for _, edge := range s.index.CallGraph {
-		if edge.File != filePath {
-			filtered = append(filtered, edge)
-		} else {
-			removed = true
-		}
+	if edges, ok := s.edges[filePath]; ok {
+		s.removalVisits += uint64(len(edges))
+		delete(s.edges, filePath)
+		s.invalidateEdgeCache()
+		removed = true
 	}
-	s.index.CallGraph = filtered
 
 	if _, ok := s.fileIndex[filePath]; ok {
 		delete(s.fileIndex, filePath)
@@ -349,11 +701,20 @@ func (s *GOBSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbo
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	symbols := s.index.Symbols[name]
-	if symbols == nil {
+	byFile := s.symbols[name]
+	if len(byFile) == 0 {
 		return []Symbol{}, nil
 	}
-	return append([]Symbol(nil), symbols...), nil
+	return append([]Symbol(nil), flattenByFile(byFile)...), nil
+}
+
+// symbolsNamedLocked returns the shared (read-only) symbols for name.
+func (s *GOBSymbolStore) symbolsNamedLocked(name string) []Symbol {
+	byFile := s.symbols[name]
+	if len(byFile) == 0 {
+		return nil
+	}
+	return flattenByFile(byFile)
 }
 
 // LookupCallers finds all references/callers of a symbol.
@@ -361,11 +722,11 @@ func (s *GOBSymbolStore) LookupCallers(ctx context.Context, symbolName string) (
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	refs := s.index.References[symbolName]
-	if refs == nil {
+	byFile := s.refs[symbolName]
+	if len(byFile) == 0 {
 		return []Reference{}, nil
 	}
-	return filterByReferenceKinds(refs, RefKindCall, ""), nil
+	return filterByReferenceKinds(flattenByFile(byFile), RefKindCall, ""), nil
 }
 
 // LookupCallees finds all symbols called by a function.
@@ -376,7 +737,7 @@ func (s *GOBSymbolStore) LookupCallees(ctx context.Context, symbolName string, f
 	var callees []Reference
 	seen := make(map[string]bool)
 
-	for _, edge := range s.index.CallGraph {
+	for _, edge := range s.allEdgesLocked() {
 		if edge.Caller == symbolName {
 			key := fmt.Sprintf("%s:%d", edge.File, edge.Line)
 			if seen[key] {
@@ -385,15 +746,13 @@ func (s *GOBSymbolStore) LookupCallees(ctx context.Context, symbolName string, f
 			seen[key] = true
 
 			// Find reference details
-			if refs, ok := s.index.References[edge.Callee]; ok {
-				for _, ref := range refs {
-					if !isCallReference(ref) {
-						continue
-					}
-					if ref.CallerName == symbolName && ref.File == edge.File && ref.Line == edge.Line {
-						callees = append(callees, ref)
-						break
-					}
+			for _, ref := range s.refs[edge.Callee][edge.File] {
+				if !isCallReference(ref) {
+					continue
+				}
+				if ref.CallerName == symbolName && ref.Line == edge.Line {
+					callees = append(callees, ref)
+					break
 				}
 			}
 
@@ -416,11 +775,11 @@ func (s *GOBSymbolStore) LookupReaders(ctx context.Context, symbolName string) (
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	refs := s.index.References[symbolName]
-	if refs == nil {
+	byFile := s.refs[symbolName]
+	if len(byFile) == 0 {
 		return []Reference{}, nil
 	}
-	return filterByReferenceKinds(refs, RefKindRead), nil
+	return filterByReferenceKinds(flattenByFile(byFile), RefKindRead), nil
 }
 
 // LookupWriters finds property/data writers for a symbol name.
@@ -428,11 +787,11 @@ func (s *GOBSymbolStore) LookupWriters(ctx context.Context, symbolName string) (
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	refs := s.index.References[symbolName]
-	if refs == nil {
+	byFile := s.refs[symbolName]
+	if len(byFile) == 0 {
 		return []Reference{}, nil
 	}
-	return filterByReferenceKinds(refs, RefKindWrite), nil
+	return filterByReferenceKinds(flattenByFile(byFile), RefKindWrite), nil
 }
 
 func filterByReferenceKinds(refs []Reference, kinds ...string) []Reference {
@@ -475,6 +834,7 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		Edges: []CallEdge{},
 		Depth: depth,
 	}
+	allEdges := s.allEdgesLocked()
 
 	// BFS to build graph up to depth
 	visited := make(map[string]bool)
@@ -486,7 +846,7 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 	edgeSeen := make(map[string]bool)
 
 	shouldTraverse := func(name string, isRoot bool) bool {
-		symbols := s.index.Symbols[name]
+		symbols := s.symbolsNamedLocked(name)
 		if len(symbols) == 0 {
 			return false
 		}
@@ -501,8 +861,8 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		if edge.Caller != edge.Callee {
 			return false
 		}
-		for _, sym := range s.index.Symbols[edge.Caller] {
-			if sym.File == edge.File && sym.Line == edge.Line {
+		for _, sym := range s.symbols[edge.Caller][edge.File] {
+			if sym.Line == edge.Line {
 				return true
 			}
 		}
@@ -519,12 +879,12 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		visited[current.name] = true
 
 		// Add node
-		if symbols, ok := s.index.Symbols[current.name]; ok && len(symbols) > 0 {
+		if symbols := s.symbolsNamedLocked(current.name); len(symbols) > 0 {
 			graph.Nodes[current.name] = symbols[0]
 		}
 
 		// Find edges (both callers and callees)
-		for _, edge := range s.index.CallGraph {
+		for _, edge := range allEdges {
 			if edge.Caller == current.name {
 				if isDeclarationSelfEdge(edge) {
 					continue
@@ -549,7 +909,7 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 				}
 				// Ensure caller node is present in the graph.
 				if _, exists := graph.Nodes[edge.Caller]; !exists {
-					if syms, ok := s.index.Symbols[edge.Caller]; ok && len(syms) > 0 {
+					if syms := s.symbolsNamedLocked(edge.Caller); len(syms) > 0 {
 						graph.Nodes[edge.Caller] = syms[0]
 					}
 				}
@@ -566,12 +926,8 @@ func (s *GOBSymbolStore) GetSymbolsForFile(ctx context.Context, filePath string)
 	defer s.mu.RUnlock()
 
 	var result []Symbol
-	for _, symbols := range s.index.Symbols {
-		for _, sym := range symbols {
-			if sym.File == filePath {
-				result = append(result, sym)
-			}
-		}
+	for _, name := range s.fileSymNames[filePath] {
+		result = append(result, s.symbols[name][filePath]...)
 	}
 	return result, nil
 }
@@ -581,8 +937,9 @@ func (s *GOBSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	edges := make([]CallEdge, len(s.index.CallGraph))
-	copy(edges, s.index.CallGraph)
+	all := s.allEdgesLocked()
+	edges := make([]CallEdge, len(all))
+	copy(edges, all)
 	return edges, nil
 }
 
@@ -596,27 +953,20 @@ func (s *GOBSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	totalSymbols := 0
-	for _, syms := range s.index.Symbols {
-		totalSymbols += len(syms)
-	}
-
-	totalRefs := 0
-	for _, refs := range s.index.References {
-		totalRefs += len(refs)
-	}
-
 	var size int64
 	if info, err := os.Stat(s.indexPath); err == nil {
 		size = info.Size()
 	}
+	if info, err := os.Stat(s.logPath); err == nil && s.logID != "" {
+		size += info.Size()
+	}
 
 	return &SymbolStats{
-		TotalSymbols:    totalSymbols,
-		TotalReferences: totalRefs,
+		TotalSymbols:    s.totalSymbols,
+		TotalReferences: s.totalRefs,
 		TotalFiles:      len(s.fileIndex),
 		IndexSize:       size,
-		LastUpdated:     s.index.UpdatedAt,
+		LastUpdated:     s.updatedAt,
 	}, nil
 }
 
