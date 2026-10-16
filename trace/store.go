@@ -22,7 +22,8 @@ import (
 // store_log.go). Persist appends the files that changed since the last
 // persist to the log and rewrites the base only when the log has grown past
 // a fraction of the base, so a one-file change no longer rewrites the whole
-// snapshot.
+// snapshot. A quiet store also merges after ten minutes, through the
+// watcher's periodic Persist calls, so older readers see recent changes.
 //
 // In memory every symbol, reference and call edge is grouped by the file
 // named in its File field, and each file remembers which names it
@@ -59,7 +60,10 @@ type GOBSymbolStore struct {
 	logID string
 	// logSize is the length of the valid log prefix; 0 means the log must
 	// be (re)created with a fresh header before the next append.
-	logSize int64
+	logSize   int64
+	oldestLog time.Time
+	lastSaved time.Time
+	now       func() time.Time
 	// baseStamp identifies the base file this store last read or wrote, so
 	// a base replaced by another process is never extended with our log.
 	baseStamp fileStamp
@@ -110,6 +114,7 @@ func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
 		indexPath:                 indexPath,
 		lockPath:                  indexPath + ".lock",
 		logPath:                   indexPath + ".log",
+		now:                       time.Now,
 		constructorPersistPending: true,
 	}
 	s.resetUnlocked()
@@ -132,6 +137,8 @@ func (s *GOBSymbolStore) resetUnlocked() {
 	s.dirty = make(map[string]bool)
 	s.logID = ""
 	s.logSize = 0
+	s.oldestLog = time.Time{}
+	s.lastSaved = time.Time{}
 	s.baseStamp = fileStamp{}
 	s.invalidateEdgeCache()
 }
@@ -208,18 +215,20 @@ func (s *GOBSymbolStore) loadUnlocked() (bool, error) {
 // applyBaseUnlocked distributes a decoded snapshot into per-file groups.
 func (s *GOBSymbolStore) applyBaseUnlocked(data *gobSymbolData) {
 	for name, list := range data.Index.Symbols {
-		for _, sym := range list {
-			s.appendSymbolUnlocked(name, sym)
+		s.symbols[name] = groupFileEntries(list, func(v Symbol) string { return v.File })
+		s.totalSymbols += len(list)
+		for file := range s.symbols[name] {
+			s.fileSymNames[file] = append(s.fileSymNames[file], name)
 		}
 	}
 	for name, list := range data.Index.References {
-		for _, ref := range list {
-			s.appendRefUnlocked(name, ref)
+		s.refs[name] = groupFileEntries(list, func(v Reference) string { return v.File })
+		s.totalRefs += len(list)
+		for file := range s.refs[name] {
+			s.fileRefNames[file] = append(s.fileRefNames[file], name)
 		}
 	}
-	for _, edge := range data.Index.CallGraph {
-		s.edges[edge.File] = append(s.edges[edge.File], edge)
-	}
+	s.edges = groupFileEntries(data.Index.CallGraph, func(v CallEdge) string { return v.File })
 	s.updatedAt = data.Index.UpdatedAt
 	if data.Index.Version != 0 {
 		s.version = data.Index.Version
@@ -267,7 +276,7 @@ func (s *GOBSymbolStore) appendRefUnlocked(name string, ref Reference) {
 func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.constructorPersistPending && len(s.dirty) == 0 {
+	if !s.constructorPersistPending && len(s.dirty) == 0 && !s.idleMergeDueUnlocked() {
 		return nil
 	}
 
@@ -277,11 +286,11 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 
 	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return s.persistUnlocked()
+		return fmt.Errorf("failed to open symbol lock: %w", err)
 	}
 	defer lockFile.Close()
 	if err := fileutil.FlockExclusive(lockFile, false); err != nil {
-		return s.persistUnlocked()
+		return fmt.Errorf("failed to lock symbol index: %w", err)
 	}
 	defer func() {
 		_ = fileutil.Funlock(lockFile)
@@ -291,8 +300,17 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 }
 
 func (s *GOBSymbolStore) persistUnlocked() error {
-	now := time.Now()
-	if s.canAppendUnlocked() {
+	now := s.now()
+	if s.idleMergeDueUnlocked() {
+		if !s.canAppendUnlocked() {
+			if err := s.reloadForMergeUnlocked(); err != nil {
+				return err
+			}
+		}
+		return s.compactUnlocked(now)
+	}
+	canAppend := s.canAppendUnlocked()
+	if canAppend {
 		batch, err := s.encodeDirtyBatchUnlocked(now)
 		if err != nil {
 			return err
@@ -306,7 +324,16 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 			return nil
 		}
 	}
+	if !canAppend && s.baseStamp.valid && s.logID != "" {
+		if err := s.reloadForMergeUnlocked(); err != nil {
+			return err
+		}
+	}
 	return s.compactUnlocked(now)
+}
+
+func (s *GOBSymbolStore) idleMergeDueUnlocked() bool {
+	return len(s.dirty) == 0 && !s.oldestLog.IsZero() && s.now().Sub(s.oldestLog) >= 10*time.Minute && s.now().Sub(s.lastSaved) >= time.Minute
 }
 
 // canAppendUnlocked reports whether the base on disk is the one our log
@@ -322,7 +349,7 @@ func (s *GOBSymbolStore) canAppendUnlocked() bool {
 		return false
 	}
 	current := statStamp(info)
-	return current.size == s.baseStamp.size && current.modTime.Equal(s.baseStamp.modTime)
+	return current.size == s.baseStamp.size && current.modTime.Equal(s.baseStamp.modTime) && s.logMatchesUnlocked()
 }
 
 func (s *GOBSymbolStore) finishPersistUnlocked() {
@@ -334,6 +361,7 @@ func (s *GOBSymbolStore) finishPersistUnlocked() {
 // compactUnlocked rewrites the base snapshot with a new log identity and
 // drops the log it supersedes.
 func (s *GOBSymbolStore) compactUnlocked(now time.Time) error {
+	defer s.invalidateEdgeCache()
 	logID, err := newLogID()
 	if err != nil {
 		return err
@@ -394,6 +422,7 @@ func (s *GOBSymbolStore) compactUnlocked(now time.Time) error {
 	// append truncates it (logSize 0 forces a fresh header).
 	_ = os.Remove(s.logPath)
 	s.logSize = 0
+	s.oldestLog = time.Time{}
 	s.updatedAt = now
 	s.finishPersistUnlocked()
 	return nil
@@ -513,6 +542,7 @@ func (s *GOBSymbolStore) SaveFileWithSignature(ctx context.Context, filePath str
 // symbols/references/edges changed, not only its metadata.
 func (s *GOBSymbolStore) markDirtyUnlocked(file string, entries bool) {
 	s.mutationGeneration++
+	s.lastSaved = s.now()
 	s.dirty[file] = entries || s.dirty[file]
 }
 
@@ -696,7 +726,10 @@ func (s *GOBSymbolStore) removeEntriesUnlocked(filePath string) bool {
 	return removed
 }
 
-// LookupSymbol finds symbol definitions by name.
+// LookupSymbol finds symbol definitions by name, ordered by file path.
+// Within a file, extraction order is preserved. Unlike the old flat store,
+// cross-file insertion order is not retained; GetCallGraph picks the first
+// file path when a name has multiple definitions.
 func (s *GOBSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbol, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -929,6 +962,12 @@ func (s *GOBSymbolStore) GetSymbolsForFile(ctx context.Context, filePath string)
 	for _, name := range s.fileSymNames[filePath] {
 		result = append(result, s.symbols[name][filePath]...)
 	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Line != result[j].Line {
+			return result[i].Line < result[j].Line
+		}
+		return result[i].Name < result[j].Name
+	})
 	return result, nil
 }
 
@@ -954,10 +993,12 @@ func (s *GOBSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	defer s.mu.RUnlock()
 
 	var size int64
+	baseMatches := false
 	if info, err := os.Stat(s.indexPath); err == nil {
 		size = info.Size()
+		baseMatches = s.baseStamp.valid && size == s.baseStamp.size && info.ModTime().Equal(s.baseStamp.modTime)
 	}
-	if info, err := os.Stat(s.logPath); err == nil && s.logID != "" {
+	if info, err := os.Stat(s.logPath); err == nil && baseMatches && s.logID != "" && s.logHeaderMatchesUnlocked() {
 		size += info.Size()
 	}
 

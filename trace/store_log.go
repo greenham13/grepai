@@ -106,6 +106,59 @@ func (s *GOBSymbolStore) logTooLargeUnlocked(frameSize int64) bool {
 	return size+frameSize > limit
 }
 
+func (s *GOBSymbolStore) logHeaderMatchesUnlocked() bool {
+	file, err := os.Open(s.logPath)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	header := symbolLogHeader(s.logID)
+	got := make([]byte, len(header))
+	_, err = io.ReadFull(file, got)
+	return err == nil && bytes.Equal(got, header)
+}
+
+func (s *GOBSymbolStore) logMatchesUnlocked() bool {
+	info, err := os.Stat(s.logPath)
+	if os.IsNotExist(err) {
+		return s.logSize == 0
+	}
+	return err == nil && info.Size() == s.logSize && s.logHeaderMatchesUnlocked()
+}
+
+// The disk lock is held. Keep other writers' changes, then apply ours.
+func (s *GOBSymbolStore) reloadForMergeUnlocked() error {
+	frame, err := s.encodeDirtyBatchUnlocked(s.now())
+	if err != nil {
+		return err
+	}
+	var pending symbolLogBatch
+	if err := gob.NewDecoder(bytes.NewReader(frame[8:])).Decode(&pending); err != nil {
+		return err
+	}
+	fresh := NewGOBSymbolStore(s.indexPath)
+	loaded, err := fresh.loadUnlocked()
+	if err != nil {
+		return err
+	}
+	if !loaded {
+		return nil
+	}
+	for i := range pending.Records {
+		fresh.applyLogRecordUnlocked(&pending.Records[i])
+	}
+	s.symbols, s.refs, s.edges = fresh.symbols, fresh.refs, fresh.edges
+	s.fileSymNames, s.fileRefNames = fresh.fileSymNames, fresh.fileRefNames
+	s.totalSymbols, s.totalRefs = fresh.totalSymbols, fresh.totalRefs
+	s.fileIndex = fresh.fileIndex
+	s.fileContentHashes, s.fileExtractorVersions = fresh.fileContentHashes, fresh.fileExtractorVersions
+	s.updatedAt, s.version = fresh.updatedAt, fresh.version
+	s.logID, s.logSize, s.baseStamp = fresh.logID, fresh.logSize, fresh.baseStamp
+	s.oldestLog = fresh.oldestLog
+	s.invalidateEdgeCache()
+	return nil
+}
+
 func (s *GOBSymbolStore) appendLogUnlocked(frame []byte) error {
 	file, err := os.OpenFile(s.logPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -134,6 +187,9 @@ func (s *GOBSymbolStore) appendLogUnlocked(frame []byte) error {
 		return fmt.Errorf("failed to close symbol log: %w", err)
 	}
 	s.logSize = offset + int64(len(data))
+	if s.oldestLog.IsZero() {
+		s.oldestLog = s.now()
+	}
 	return nil
 }
 
@@ -176,7 +232,7 @@ func (s *GOBSymbolStore) replayLogUnlocked() error {
 			return fmt.Errorf("failed to read symbol log: %w", err)
 		}
 		size := int64(binary.LittleEndian.Uint32(prefix[0:4]))
-		if offset+8+size > info.Size() {
+		if size == 0 || offset+8+size > info.Size() {
 			break // torn final frame
 		}
 		payload := make([]byte, size)
@@ -191,12 +247,18 @@ func (s *GOBSymbolStore) replayLogUnlocked() error {
 		}
 		var batch symbolLogBatch
 		if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&batch); err != nil {
-			// The checksum matched, so this is not a torn write.
+			if offset+8+size == info.Size() {
+				break
+			}
 			return fmt.Errorf("failed to decode symbol log at offset %d: %w", offset, err)
 		}
 		for i := range batch.Records {
 			s.applyLogRecordUnlocked(&batch.Records[i])
 		}
+		if s.oldestLog.IsZero() {
+			s.oldestLog = batch.UpdatedAt
+		}
+		s.lastSaved = batch.UpdatedAt
 		s.updatedAt = batch.UpdatedAt
 		offset += 8 + size
 	}
