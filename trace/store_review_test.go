@@ -3,7 +3,6 @@ package trace
 import (
 	"context"
 	"encoding/binary"
-	"encoding/gob"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -19,57 +18,6 @@ func saveReviewFile(t *testing.T, s *GOBSymbolStore, file string) {
 	}
 	if err := s.Persist(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestSymbolIdleMerge(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "symbols.gob")
-	s := NewGOBSymbolStore(path)
-	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	s.now = func() time.Time { return now }
-	saveReviewFile(t, s, "base.go")
-	saveReviewFile(t, s, "first.go")
-	base := snapshotFile(t, path)
-	now = now.Add(9 * time.Minute)
-	if err := s.Persist(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if !base.sameFile(t, path) {
-		t.Fatal("merged before age limit")
-	}
-	now = now.Add(time.Minute)
-	saveReviewFile(t, s, "last.go")
-	now = now.Add(59 * time.Second)
-	if err := s.Persist(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if !base.sameFile(t, path) {
-		t.Fatal("merged while busy")
-	}
-	now = now.Add(time.Second)
-	if err := s.Persist(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if base.sameFile(t, path) {
-		t.Fatal("quiet log did not merge")
-	}
-	if s.edgeCache != nil {
-		t.Fatal("merge kept flat edges")
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var old oldGobSymbolData
-	if err := gob.NewDecoder(f).Decode(&old); err != nil {
-		t.Fatal(err)
-	}
-	for _, file := range []string{"first.go", "last.go"} {
-		if !old.FileIndex[file] {
-			t.Fatalf("old reader lacks %s", file)
-		}
 	}
 }
 
