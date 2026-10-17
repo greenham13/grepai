@@ -106,6 +106,9 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 		APIKey: apiKey,
 		GrpcOptions: []grpc.DialOption{
 			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64 * 1024 * 1024)),
+			// No TXT service-config lookup per connect: WSL's DNS drops TXT
+			// queries, which cost 10 s on every client open.
+			grpc.WithDisableServiceConfig(),
 		},
 	})
 	if err != nil {
