@@ -57,7 +57,7 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 					}
 				} else {
 					must := request.GetFilter().GetMust()
-					if len(must) != 1 || must[0].GetField().GetKey() != "file_path" || must[0].GetField().GetMatch().GetText() != prefix || request.GetLimit() != 4 {
+					if len(must) != 1 || must[0].GetField().GetKey() != "file_path" || must[0].GetField().GetMatch().GetPrefix() != prefix || request.GetLimit() != 4 {
 						t.Errorf("scoped request: %v", request)
 					}
 				}
@@ -150,6 +150,14 @@ func TestQdrantSearchPathFilterLive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Model an existing collection with the old plain keyword index.
+	_, err = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
+		CollectionName: name, FieldName: "file_path",
+		FieldType: qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword), Wait: qdrant.PtrOf(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Reopen existing data: no embedding or payload migration is needed.
 	if err := s.ensureCollection(ctx); err != nil {
 		t.Fatal(err)
@@ -169,7 +177,22 @@ func TestQdrantSearchPathFilterLive(t *testing.T) {
 			t.Fatalf("%q returned %+v", prefix, results)
 		}
 	}
-	results, err := s.Search(ctx, []float32{1, 0}, 2, SearchOptions{})
+	// A partial final token must match; full-text word matching loses it.
+	results, err := s.Search(ctx, []float32{1, 0}, 2, SearchOptions{PathPrefix: "ws/project/src/be"})
+	if err != nil || len(results) != 1 || results[0].Chunk.FilePath != "ws/project/src/best.go" {
+		t.Fatalf("partial filename: %+v %v", results, err)
+	}
+	pointsByPath, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
+		CollectionName: name,
+		Filter:         &qdrant.Filter{Must: []*qdrant.Condition{qdrant.NewMatch("file_path", "ws/project/src/best.go")}},
+	})
+	if err != nil || len(pointsByPath) != 1 {
+		t.Fatalf("exact lookup after upgrade: %+v %v", pointsByPath, err)
+	}
+	if err := s.ensureCollection(ctx); err != nil {
+		t.Fatalf("repeated open: %v", err)
+	}
+	results, err = s.Search(ctx, []float32{1, 0}, 2, SearchOptions{})
 	if err != nil || len(results) != 2 || results[0].Score < 0.99 {
 		t.Fatalf("unscoped: %+v %v", results, err)
 	}

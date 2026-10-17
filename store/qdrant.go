@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 // sanitizeUTF8 ensures the string contains only valid UTF-8 characters.
@@ -118,6 +119,7 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 	}
 
 	if err := store.ensureCollection(ctx); err != nil {
+		_ = client.Close()
 		return nil, err
 	}
 
@@ -146,19 +148,40 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 		}
 	}
 
-	// Create keyword field indexes for the payload fields grepai filters on:
-	// content_hash (embedding cache lookups) and file_path (GetDocument,
-	// DeleteByFile and prefix-filtered search). Without the file_path index
-	// every per-file lookup scans the whole collection, which on a ~100k-file
-	// index kept Qdrant at 100% of one core during indexing.
-	// Errors are intentionally ignored because the index may already exist.
+	info, err := s.client.GetCollectionInfo(ctx, s.collectionName)
+	if err != nil {
+		return fmt.Errorf("failed to read payload indexes: %w", err)
+	}
 	for _, field := range []string{"content_hash", "file_path"} {
-		_, _ = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
+		index := info.GetPayloadSchema()[field]
+		params := index.GetParams().GetKeywordIndexParams()
+		if index != nil && index.GetDataType() == qdrant.PayloadSchemaType_Keyword &&
+			(field != "file_path" || params.GetPrefix() != nil) {
+			continue
+		}
+		if index != nil && index.GetDataType() != qdrant.PayloadSchemaType_Keyword {
+			return fmt.Errorf("payload index %s must be keyword, got %s", field, index.GetDataType())
+		}
+		// Upgrade in place: prefix keyword indexes retain exact-match lookups.
+		keyword := &qdrant.KeywordIndexParams{}
+		if params != nil {
+			keyword = proto.Clone(params).(*qdrant.KeywordIndexParams)
+		}
+		if field == "file_path" {
+			keyword.Prefix = &qdrant.KeywordPrefixParams{}
+		}
+		_, err := s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
 			CollectionName: s.collectionName,
 			FieldName:      field,
 			FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
-			Wait:           qdrant.PtrOf(true),
+			FieldIndexParams: &qdrant.PayloadIndexParams{
+				IndexParams: &qdrant.PayloadIndexParams_KeywordIndexParams{KeywordIndexParams: keyword},
+			},
+			Wait: qdrant.PtrOf(true),
 		})
+		if err != nil {
+			return fmt.Errorf("failed to ensure %s keyword index: %w", field, err)
+		}
 	}
 
 	return nil
@@ -314,15 +337,13 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 		return nil, fmt.Errorf("limit must be positive, got: %d", limit)
 	}
 
-	// file_path has a keyword index, not a full-text index: MatchText is a
-	// case-sensitive substring filter. Keep the exact prefix check below.
-	// Filtering before ranking prevents unrelated projects consuming the limit.
+	// Filter before ranking so unrelated projects cannot consume the limit.
 	var filter *qdrant.Filter
 	// A bare workspace prefix already spans its dedicated collection. Keep
 	// its client guard, but avoid a substring scan of every point.
 	wholeWorkspace := strings.HasPrefix(s.collectionName, "workspace_") && opts.PathPrefix == strings.TrimPrefix(s.collectionName, "workspace_")+"/"
 	if opts.PathPrefix != "" && !wholeWorkspace {
-		filter = &qdrant.Filter{Must: []*qdrant.Condition{qdrant.NewMatchText("file_path", opts.PathPrefix)}}
+		filter = &qdrant.Filter{Must: []*qdrant.Condition{qdrant.NewMatchPrefix("file_path", opts.PathPrefix)}}
 	}
 	fetchLimit := limit
 	if opts.PathPrefix != "" {
