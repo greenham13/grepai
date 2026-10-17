@@ -256,6 +256,7 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 		projects = append(projects, project)
 	}
 	sort.Slice(projects, func(i, j int) bool { return projects[i].project.Name < projects[j].project.Name })
+	stale := projectsWithoutLiveWatch(runtimes)
 	return startWatchMutationWorker(ctx, fence, func(ctx context.Context) {
 		runSharedStartupReconciliation(ctx, projects,
 			reconcileDuration("GREPAI_STARTUP_RECONCILE_DELAY", 15*time.Second),
@@ -266,7 +267,7 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 			case <-ctx.Done():
 				return
 			case <-staleRequests:
-				runStartupReconciliation(ctx, projectsWithoutLiveWatch(runtimes), 0,
+				runStartupReconciliation(ctx, stale, 0,
 					reconcileDuration("GREPAI_STARTUP_RECONCILE_PACE", 250*time.Millisecond),
 					func(context.Context, *workspaceProjectRuntime) (string, bool) { return "", false },
 					reconcileWorkspaceProject)

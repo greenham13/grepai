@@ -29,25 +29,6 @@ func persistProjectPeriodically(ctx context.Context, fence *watchMutationFence, 
 	})
 }
 
-func persistWorkspacePeriodically(ctx context.Context, fence *watchMutationFence, st store.VectorStore, runtimes map[string]*workspaceProjectRuntime) error {
-	return fence.handle(ctx, func(persistCtx context.Context) {
-		if err := st.Persist(persistCtx); err != nil {
-			log.Printf("Warning: failed to persist index: %v", err)
-		}
-		for _, runtime := range runtimes {
-			persistScanSnapshot(persistCtx, runtime.idx, true)
-			if err := runtime.symbolStore.Persist(persistCtx); err != nil {
-				log.Printf("Warning: failed to persist symbol index for %s: %v", runtime.project.Name, err)
-			}
-			if runtime.rpgStore != nil {
-				if err := runtime.rpgStore.Persist(persistCtx); err != nil {
-					log.Printf("Warning: failed to persist RPG graph for %s: %v", runtime.project.Name, err)
-				}
-			}
-		}
-	})
-}
-
 func persistScanSnapshot(ctx context.Context, idx *indexer.Indexer, force bool) {
 	if err := idx.PersistScanSnapshot(ctx, force); err != nil {
 		log.Printf("Warning: %v", err)

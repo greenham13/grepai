@@ -475,6 +475,7 @@ type rpgRealtimeManager struct {
 	lastPersistRun   time.Time
 	derivedFailures  int
 	maxDirtyFileSize int
+	onMutation       func()
 }
 
 func newRPGRealtimeManager(maxDirtyFiles int) *rpgRealtimeManager {
@@ -493,6 +494,9 @@ func (m *rpgRealtimeManager) MarkFileDirty(filePath string) {
 
 	m.dirtyDerived = true
 	m.dirtyPersist = true
+	if m.onMutation != nil {
+		m.onMutation()
+	}
 	if filePath != "" {
 		m.dirtyFiles[filePath] = struct{}{}
 	}
@@ -506,6 +510,9 @@ func (m *rpgRealtimeManager) MarkPersistDirty() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.dirtyPersist = true
+	if m.onMutation != nil {
+		m.onMutation()
+	}
 }
 
 func (m *rpgRealtimeManager) ShouldPersist() bool {
@@ -2782,9 +2789,7 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 	return nil
 }
 
-// staleRescanEveryTicks: projects without live file watching are rescanned
-// every this many 30-second persist ticks (10 = every 5 minutes).
-const staleRescanEveryTicks = 10
+const staleReconcileInterval = 5 * time.Minute
 
 func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -2880,6 +2885,8 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		}
 	}()
 
+	persistence := newWorkspacePersistence(30 * time.Second)
+	defer persistence.close()
 	workerCtx, stopWorkers := context.WithCancel(ctx)
 	defer stopWorkers()
 	workers := make([]watchMutationWorker, 0, len(ws.Projects)*2+1)
@@ -2905,6 +2912,7 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 			}
 			go monitorWorkspaceWatcher(workerCtx, runtime, mutationFence, func() { _ = backend.Close() }, withdrawReadiness, fatalChan)
 		}
+		persistence.track(runtime)
 		watchCfg := runtime.cfg.Watch
 		writer := startWorkspaceProjectWriter(workerCtx, mutationFence, runtime)
 		workers = append(workers, writer)
@@ -2982,7 +2990,7 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	staleCount := len(projectsWithoutLiveWatch(runtimes))
 	staleNote := ""
 	if staleCount > 0 {
-		staleNote = fmt.Sprintf(" (%d without live file watching; rescanned every %d min)", staleCount, staleRescanEveryTicks*30/60)
+		staleNote = fmt.Sprintf(" (%d without live file watching; rescanned every %d min)", staleCount, int(staleReconcileInterval/time.Minute))
 	}
 	if !isBackgroundChild {
 		fmt.Printf("\nWatching %d projects for changes...%s (Press Ctrl+C to stop)\n", len(runtimes), staleNote)
@@ -2992,8 +3000,12 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 
 	staleRequests := make(chan struct{}, 1)
 	workers = append(workers, startWorkspaceReconciliation(workerCtx, mutationFence, st, runtimes, staleRequests))
-	persistTicker := time.NewTicker(30 * time.Second)
-	defer persistTicker.Stop()
+	var reconcileTicks <-chan time.Time
+	if staleCount > 0 {
+		ticker := time.NewTicker(staleReconcileInterval)
+		defer ticker.Stop()
+		reconcileTicks = ticker.C
+	}
 	err = runWorkspaceWatchLoop(&workspaceWatchLoop{
 		ctx:               ctx,
 		store:             st,
@@ -3003,8 +3015,8 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		fatals:            fatalChan,
 		signals:           sigChan,
 		stops:             wsStopCh,
-		persistTicks:      persistTicker.C,
-		staleRescanEvery:  staleRescanEveryTicks,
+		persistence:       persistence,
+		reconcileTicks:    reconcileTicks,
 		reconcileStale:    staleRequests,
 		stopForwarders:    stopForwarders,
 		stopWorkers:       stopWorkers,
@@ -3204,6 +3216,7 @@ func initializeWorkspaceStore(ctx context.Context, ws *config.Workspace) (store.
 
 // projectPrefixStore wraps a VectorStore to prefix file paths with workspace and project name
 type projectPrefixStore struct {
+	onMutation    func()
 	store         store.VectorStore
 	workspaceName string
 	projectName   string
@@ -3229,6 +3242,9 @@ func (p *projectPrefixStore) toRelSlash(absPath string) string {
 }
 
 func (p *projectPrefixStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	if len(chunks) > 0 {
+		defer p.markMutation()
+	}
 	prefixedChunks := make([]store.Chunk, len(chunks))
 	for i, c := range chunks {
 		prefixedChunks[i] = c
@@ -3244,6 +3260,12 @@ func (p *projectPrefixStore) SaveChunks(ctx context.Context, chunks []store.Chun
 	return p.store.SaveChunks(ctx, prefixedChunks)
 }
 
+func (p *projectPrefixStore) markMutation() {
+	if p.onMutation != nil {
+		p.onMutation()
+	}
+}
+
 // LookupByContentHash is global: identical content can reuse embeddings across projects.
 func (p *projectPrefixStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
 	if cache, ok := p.store.(store.EmbeddingCache); ok {
@@ -3253,6 +3275,7 @@ func (p *projectPrefixStore) LookupByContentHash(ctx context.Context, contentHas
 }
 
 func (p *projectPrefixStore) DeleteByFile(ctx context.Context, filePath string) error {
+	defer p.markMutation()
 	prefixedPath := p.getPrefix() + "/" + p.toRelSlash(filePath)
 	return p.store.DeleteByFile(ctx, prefixedPath)
 }
@@ -3267,11 +3290,13 @@ func (p *projectPrefixStore) GetDocument(ctx context.Context, filePath string) (
 }
 
 func (p *projectPrefixStore) SaveDocument(ctx context.Context, doc store.Document) error {
+	defer p.markMutation()
 	doc.Path = p.getPrefix() + "/" + p.toRelSlash(doc.Path)
 	return p.store.SaveDocument(ctx, doc)
 }
 
 func (p *projectPrefixStore) DeleteDocument(ctx context.Context, filePath string) error {
+	defer p.markMutation()
 	prefixedPath := p.getPrefix() + "/" + p.toRelSlash(filePath)
 	return p.store.DeleteDocument(ctx, prefixedPath)
 }

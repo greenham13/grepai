@@ -11,22 +11,18 @@ import (
 )
 
 type workspaceWatchLoop struct {
-	ctx          context.Context
-	store        store.VectorStore
-	runtimes     map[string]*workspaceProjectRuntime
-	watchers     []watchSource
-	fence        *watchMutationFence
-	events       <-chan workspaceWatchEvent
-	fatals       <-chan error
-	signals      <-chan os.Signal
-	stops        <-chan struct{}
-	persistTicks <-chan time.Time
-	// staleRescanEvery: every this many persist ticks, projects without a
-	// live watcher are rescanned so they do not stay stale until the next
-	// watcher start. 0 disables (tests).
+	ctx               context.Context
+	store             store.VectorStore
+	runtimes          map[string]*workspaceProjectRuntime
+	watchers          []watchSource
+	fence             *watchMutationFence
+	events            <-chan workspaceWatchEvent
+	fatals            <-chan error
+	signals           <-chan os.Signal
+	stops             <-chan struct{}
+	persistence       *workspacePersistence
+	reconcileTicks    <-chan time.Time
 	reconcileStale    chan<- struct{}
-	staleRescanEvery  int
-	persistTickCount  int
 	stopForwarders    func()
 	stopWorkers       func()
 	workers           []watchMutationWorker
@@ -54,7 +50,10 @@ func (l *workspaceWatchLoop) gracefulShutdown(message string) error {
 	}
 	l.stopWorkersAndWait()
 	l.fence.cleanup(l.ctx, func() {
-		persistWorkspaceOnShutdown(l.ctx, l.store, l.runtimes)
+		batch := l.persistence.take()
+		if len(batch) > 0 {
+			persistWorkspaceOnShutdown(l.ctx, l.store, batch)
+		}
 	})
 	return nil
 }
@@ -96,8 +95,14 @@ func rescanProjectsWithoutLiveWatch(ctx context.Context, fence *watchMutationFen
 }
 
 func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
+	if l.persistence == nil {
+		l.persistence = newWorkspacePersistence(30 * time.Second)
+	}
+	defer l.persistence.close()
 	for {
 		select {
+		case <-l.ctx.Done():
+			return l.gracefulShutdown("")
 		case <-l.signals:
 			if !l.isBackgroundChild {
 				fmt.Println("\nShutting down...")
@@ -105,8 +110,8 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 			return l.gracefulShutdown("")
 		case <-l.stops:
 			return l.gracefulShutdown("Stop file detected, shutting down...")
-		case <-l.persistTicks:
-			if err := persistWorkspacePeriodically(l.ctx, l.fence, l.store, l.runtimes); err != nil {
+		case <-l.persistence.ticks:
+			if err := l.persistence.persist(l.ctx, l.fence, l.store); err != nil {
 				if l.ctx.Err() != nil {
 					return l.gracefulShutdown("")
 				}
@@ -117,21 +122,10 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 				}
 				return fatal
 			}
-			l.persistTickCount++
-			if l.staleRescanEvery > 0 && l.persistTickCount%l.staleRescanEvery == 0 {
-				if l.reconcileStale != nil {
-					select {
-					case l.reconcileStale <- struct{}{}:
-					default:
-					}
-					continue
-				}
-				if err := rescanProjectsWithoutLiveWatch(l.ctx, l.fence, l.runtimes); err != nil {
-					if l.ctx.Err() != nil {
-						return l.gracefulShutdown("")
-					}
-					log.Printf("Warning: rescan of projects without live file watching failed: %v", err)
-				}
+		case <-l.reconcileTicks:
+			select {
+			case l.reconcileStale <- struct{}{}:
+			default:
 			}
 		case err := <-l.fatals:
 			if l.stopForwarders != nil {

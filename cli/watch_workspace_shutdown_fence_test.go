@@ -40,12 +40,16 @@ func (s *workspaceShutdownStore) Close() error {
 func TestWorkspaceGracefulPersistenceWinsFatalWithdrawalRace(t *testing.T) {
 	fence := newWatchMutationFence()
 	st := &workspaceShutdownStore{started: make(chan struct{}), release: make(chan struct{})}
+	persistence := newWorkspacePersistence(time.Hour)
+	defer persistence.close()
+	r, _ := dirtyTestRuntime(t, persistence, st)
+	persistence.mark(r)
 	signals := make(chan os.Signal, 1)
 	result := make(chan error, 1)
 	go func() {
 		result <- runWorkspaceWatchLoop(&workspaceWatchLoop{
 			ctx: context.Background(), store: st, runtimes: map[string]*workspaceProjectRuntime{},
-			fence: fence, signals: signals,
+			fence: fence, signals: signals, persistence: persistence,
 		})
 	}()
 	signals <- os.Interrupt

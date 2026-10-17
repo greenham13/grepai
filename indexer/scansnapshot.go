@@ -27,12 +27,13 @@ type scanSnapshotEntry struct {
 // scanSnapshot is only a local optimization; the vector store remains authoritative.
 // The mutex covers concurrent scan workers and serializes atomic file replacement.
 type scanSnapshot struct {
-	mu       sync.Mutex
-	path     string
-	entries  map[string]scanSnapshotEntry
-	dirty    bool
-	lastSave time.Time
-	gitState GitScanState
+	mu         sync.Mutex
+	path       string
+	entries    map[string]scanSnapshotEntry
+	dirty      bool
+	onMutation func()
+	lastSave   time.Time
+	gitState   GitScanState
 }
 
 func loadScanSnapshot(root string) *scanSnapshot {
@@ -69,6 +70,24 @@ func (s *scanSnapshot) get(path string) (scanSnapshotEntry, bool) {
 	return entry, ok
 }
 
+// SetMutationHook notifies the watch owner after snapshot changes. The hook
+// runs under the snapshot lock and must not call back into the indexer.
+func (idx *Indexer) SetMutationHook(hook func()) {
+	if idx == nil || idx.snapshot == nil {
+		return
+	}
+	idx.snapshot.mu.Lock()
+	defer idx.snapshot.mu.Unlock()
+	idx.snapshot.onMutation = hook
+}
+
+func (s *scanSnapshot) markDirty() {
+	s.dirty = true
+	if s.onMutation != nil {
+		s.onMutation()
+	}
+}
+
 func (s *scanSnapshot) record(file FileInfo, chunks int) {
 	if s == nil {
 		return
@@ -79,7 +98,7 @@ func (s *scanSnapshot) record(file FileInfo, chunks int) {
 	if old, ok := s.entries[file.Path]; !ok || old != entry {
 		s.gitState = GitScanState{}
 		s.entries[file.Path] = entry
-		s.dirty = true
+		s.markDirty()
 	}
 }
 
@@ -92,7 +111,7 @@ func (s *scanSnapshot) remove(path string) {
 	if _, ok := s.entries[path]; ok {
 		s.gitState = GitScanState{}
 		delete(s.entries, path)
-		s.dirty = true
+		s.markDirty()
 	}
 }
 
@@ -107,7 +126,7 @@ func (s *scanSnapshot) reconcile(documents map[string]bool) {
 		if !documents[path] {
 			s.gitState = GitScanState{}
 			delete(s.entries, path)
-			s.dirty = true
+			s.markDirty()
 		}
 	}
 }

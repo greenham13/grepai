@@ -138,7 +138,7 @@ func (idx *Indexer) CompleteGitScan(ctx context.Context, before GitScanState) er
 	idx.snapshot.mu.Lock()
 	after.Scope = idx.reconcileScope
 	idx.snapshot.gitState = after
-	idx.snapshot.dirty = true
+	idx.snapshot.markDirty()
 	idx.snapshot.mu.Unlock()
 	return idx.PersistScanSnapshot(ctx, true)
 }

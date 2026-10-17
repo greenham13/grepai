@@ -94,17 +94,20 @@ func TestWorkspacePeriodicPersistenceQuiescesBeforeFatalReturn(t *testing.T) {
 	fence := newWatchMutationFence()
 	fence.addWatcher(newFakeWatchSource())
 	st := &blockingPeriodicStore{started: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{})}
-	persistTicks := make(chan time.Time, 1)
+	persistence := newWorkspacePersistence(time.Hour)
+	defer persistence.close()
+	r, _ := dirtyTestRuntime(t, persistence, st)
+	persistence.mark(r)
 	fatals := make(chan error, 1)
 	withdrawn := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
 		result <- runWorkspaceWatchLoop(&workspaceWatchLoop{
 			ctx: context.Background(), store: st, runtimes: map[string]*workspaceProjectRuntime{},
-			fence: fence, persistTicks: persistTicks, fatals: fatals,
+			fence: fence, persistence: persistence, fatals: fatals,
 		})
 	}()
-	persistTicks <- time.Now()
+	persistence.ticks <- time.Now()
 	awaitWatchTestSignal(t, st.started, "workspace periodic persistence admission")
 	fatal := &watcher.FatalError{Operation: "watch", Cause: syscall.ENOSPC}
 	go func() {

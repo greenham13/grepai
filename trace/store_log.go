@@ -154,7 +154,6 @@ func (s *GOBSymbolStore) reloadForMergeUnlocked() error {
 	s.fileContentHashes, s.fileExtractorVersions = fresh.fileContentHashes, fresh.fileExtractorVersions
 	s.updatedAt, s.version = fresh.updatedAt, fresh.version
 	s.logID, s.logSize, s.baseStamp = fresh.logID, fresh.logSize, fresh.baseStamp
-	s.oldestLog = fresh.oldestLog
 	s.invalidateEdgeCache()
 	return nil
 }
@@ -187,16 +186,13 @@ func (s *GOBSymbolStore) appendLogUnlocked(frame []byte) error {
 		return fmt.Errorf("failed to close symbol log: %w", err)
 	}
 	s.logSize = offset + int64(len(data))
-	if s.oldestLog.IsZero() {
-		s.oldestLog = s.now()
-	}
 	return nil
 }
 
 // replayLogUnlocked applies the log that extends the loaded base. A missing
 // log or one written for another base is ignored; logSize stays 0 so the
 // next append starts a fresh log.
-func (s *GOBSymbolStore) replayLogUnlocked() error {
+func (s *GOBSymbolStore) replayLogUnlocked(pool symbolStrings) error {
 	file, err := os.Open(s.logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -253,12 +249,9 @@ func (s *GOBSymbolStore) replayLogUnlocked() error {
 			return fmt.Errorf("failed to decode symbol log at offset %d: %w", offset, err)
 		}
 		for i := range batch.Records {
+			pool.record(&batch.Records[i])
 			s.applyLogRecordUnlocked(&batch.Records[i])
 		}
-		if s.oldestLog.IsZero() {
-			s.oldestLog = batch.UpdatedAt
-		}
-		s.lastSaved = batch.UpdatedAt
 		s.updatedAt = batch.UpdatedAt
 		offset += 8 + size
 	}
