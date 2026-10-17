@@ -46,8 +46,11 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 			}
 			server := grpc.NewServer()
 			fail := false
+			unsupported := false
+			calls := 0
 			qdrant.RegisterPointsServer(server, &pathSearchServer{query: func(request *qdrant.QueryPoints) (*qdrant.QueryResponse, error) {
-				if !tc.filter {
+				calls++
+				if !tc.filter || ((fail || unsupported) && request.GetFilter() == nil) {
 					wantLimit := uint64(2)
 					if prefix != "" {
 						wantLimit = 4
@@ -60,6 +63,9 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 					if len(must) != 1 || must[0].GetField().GetKey() != "file_path" || must[0].GetField().GetMatch().GetPrefix() != prefix || request.GetLimit() != 4 {
 						t.Errorf("scoped request: %v", request)
 					}
+				}
+				if unsupported && request.GetFilter() != nil {
+					return nil, status.Error(codes.InvalidArgument, "prefix unsupported")
 				}
 				if fail {
 					return nil, status.Error(codes.Unavailable, "query failed")
@@ -99,9 +105,26 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 			if len(results) != 2 || results[0].Chunk.FilePath != prefix+"/a.go" || results[1].Chunk.FilePath != prefix+"/b.go" {
 				t.Fatalf("wrong results: %+v", results)
 			}
+			if tc.filter {
+				unsupported = true
+				calls = 0
+				results, err = s.Search(ctx, []float32{1, 0}, 2, SearchOptions{PathPrefix: prefix})
+				if err != nil || calls != 2 || len(results) != 2 || results[0].Chunk.FilePath != prefix+"/a.go" {
+					t.Fatalf("fallback: calls=%d results=%+v error=%v", calls, results, err)
+				}
+				unsupported = false
+			}
 			fail = true
+			calls = 0
 			if _, err := s.Search(ctx, []float32{1, 0}, 2, SearchOptions{PathPrefix: prefix}); err == nil || !strings.Contains(err.Error(), "query failed") {
 				t.Fatalf("lost query error: %v", err)
+			}
+			wantCalls := 1
+			if tc.filter {
+				wantCalls = 2
+			}
+			if calls != wantCalls {
+				t.Fatalf("calls=%d want %d", calls, wantCalls)
 			}
 		})
 	}
@@ -115,7 +138,7 @@ func TestQdrantSearchPathFilterLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	name := "test_grepai_path_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	s, err := NewQdrantStore(ctx, "localhost", 6334, false, name, "", 2)
+	s, err := NewQdrantStore(ctx, "127.0.0.1", 6334, false, name, "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}

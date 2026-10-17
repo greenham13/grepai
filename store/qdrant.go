@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -150,7 +151,8 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 
 	info, err := s.client.GetCollectionInfo(ctx, s.collectionName)
 	if err != nil {
-		return fmt.Errorf("failed to read payload indexes: %w", err)
+		log.Printf("Warning: failed to read Qdrant payload indexes: %v", err)
+		return nil
 	}
 	for _, field := range []string{"content_hash", "file_path"} {
 		index := info.GetPayloadSchema()[field]
@@ -160,7 +162,8 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 			continue
 		}
 		if index != nil && index.GetDataType() != qdrant.PayloadSchemaType_Keyword {
-			return fmt.Errorf("payload index %s must be keyword, got %s", field, index.GetDataType())
+			log.Printf("Warning: Qdrant payload index %s is %s; leaving it unchanged", field, index.GetDataType())
+			continue
 		}
 		// Upgrade in place: prefix keyword indexes retain exact-match lookups.
 		keyword := &qdrant.KeywordIndexParams{}
@@ -177,10 +180,10 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 			FieldIndexParams: &qdrant.PayloadIndexParams{
 				IndexParams: &qdrant.PayloadIndexParams_KeywordIndexParams{KeywordIndexParams: keyword},
 			},
-			Wait: qdrant.PtrOf(true),
+			Wait: qdrant.PtrOf(!exists || field != "file_path"),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to ensure %s keyword index: %w", field, err)
+			log.Printf("Warning: failed to ensure Qdrant %s keyword index: %v", field, err)
 		}
 	}
 
@@ -360,13 +363,19 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 	}
 	fetchLimitU64 := uint64(fetchLimit)
 
-	searchResult, err := s.client.Query(ctx, &qdrant.QueryPoints{
+	request := &qdrant.QueryPoints{
 		CollectionName: s.collectionName,
 		Query:          qdrant.NewQuery(queryVector...),
 		Filter:         filter,
 		Limit:          qdrant.PtrOf(fetchLimitU64),
 		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
-	})
+	}
+	searchResult, err := s.client.Query(ctx, request)
+	if err != nil && filter != nil {
+		log.Printf("Warning: Qdrant prefix query failed; retrying with client path filtering: %v", err)
+		request.Filter = nil
+		searchResult, err = s.client.Query(ctx, request)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
 	}
