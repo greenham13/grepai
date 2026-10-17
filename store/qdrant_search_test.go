@@ -26,8 +26,20 @@ func (s *pathSearchServer) Query(_ context.Context, request *qdrant.QueryPoints)
 }
 
 func TestQdrantSearchPathFilter(t *testing.T) {
-	for _, prefix := range []string{"", "ws/project/src", "ws/project/with space", "ws/project/日本語"} {
-		t.Run(prefix, func(t *testing.T) {
+	for _, tc := range []struct {
+		prefix, collection string
+		filter             bool
+	}{
+		{"", "test_path_filter", false},
+		{"ws/", "workspace_ws", false},
+		{"ws/", "shared_collection", true},
+		{"src/", "folder_collection", true},
+		{"ws/project/src", "workspace_ws", true},
+		{"ws/project/with space", "workspace_ws", true},
+		{"ws/project/日本語", "workspace_ws", true},
+	} {
+		prefix := tc.prefix
+		t.Run(tc.collection+"/"+prefix, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -35,8 +47,12 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 			server := grpc.NewServer()
 			fail := false
 			qdrant.RegisterPointsServer(server, &pathSearchServer{query: func(request *qdrant.QueryPoints) (*qdrant.QueryResponse, error) {
-				if prefix == "" {
-					if request.GetFilter() != nil || request.GetLimit() != 2 {
+				if !tc.filter {
+					wantLimit := uint64(2)
+					if prefix != "" {
+						wantLimit = 4
+					}
+					if request.GetFilter() != nil || request.GetLimit() != wantLimit {
 						t.Errorf("unscoped request: %v", request)
 					}
 				} else {
@@ -73,7 +89,7 @@ func TestQdrantSearchPathFilter(t *testing.T) {
 					t.Error(err)
 				}
 			})
-			s := &QdrantStore{client: client, collectionName: "test_path_filter"}
+			s := &QdrantStore{client: client, collectionName: tc.collection}
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			results, err := s.Search(ctx, []float32{1, 0}, 2, SearchOptions{PathPrefix: prefix})

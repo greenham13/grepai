@@ -318,7 +318,10 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 	// case-sensitive substring filter. Keep the exact prefix check below.
 	// Filtering before ranking prevents unrelated projects consuming the limit.
 	var filter *qdrant.Filter
-	if opts.PathPrefix != "" {
+	// A bare workspace prefix already spans its dedicated collection. Keep
+	// its client guard, but avoid a substring scan of every point.
+	wholeWorkspace := strings.HasPrefix(s.collectionName, "workspace_") && opts.PathPrefix == strings.TrimPrefix(s.collectionName, "workspace_")+"/"
+	if opts.PathPrefix != "" && !wholeWorkspace {
 		filter = &qdrant.Filter{Must: []*qdrant.Condition{qdrant.NewMatchText("file_path", opts.PathPrefix)}}
 	}
 	fetchLimit := limit
