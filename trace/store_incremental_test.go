@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -364,6 +365,73 @@ func TestGOBSymbolStore_LogCompactsWhenLarge(t *testing.T) {
 	got, _ := check.GetStats(ctx)
 	if got.TotalFiles != want.TotalFiles || got.TotalSymbols != want.TotalSymbols || got.TotalReferences != want.TotalReferences {
 		t.Fatalf("after compaction got %+v want %+v", got, want)
+	}
+}
+
+func TestGOBSymbolStore_RepeatedEditsBoundSmallBaseLog(t *testing.T) {
+	ctx := context.Background()
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+	name := strings.Repeat("x", 32<<10)
+	save := func(line int) {
+		t.Helper()
+		if err := store.SaveFile(ctx, "a.go", []Symbol{{Name: name, File: "a.go", Line: line}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save(1)
+	if err := store.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if size := snapshotFile(t, indexPath).info.Size(); size >= 1<<20 {
+		t.Fatalf("base is not small: %d bytes", size)
+	}
+
+	merges := 0
+	for line := 2; line <= 100; line++ {
+		base := snapshotFile(t, indexPath)
+		limit := max(int64(1<<20), base.info.Size()/4)
+		save(line)
+		frame, err := store.encodeDirtyBatchUnlocked(store.now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextSize := store.logSize
+		if nextSize == 0 {
+			nextSize = int64(len(symbolLogHeader(store.logID)))
+		}
+		nextSize += int64(len(frame))
+		if err := store.Persist(ctx); err != nil {
+			t.Fatal(err)
+		}
+		merged := !base.sameFile(t, indexPath)
+		if merged != (nextSize > limit) {
+			t.Fatalf("edit %d: merged=%v, projected log=%d, limit=%d", line, merged, nextSize, limit)
+		}
+		if merged {
+			merges++
+		}
+		info, err := os.Stat(indexPath + ".log")
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err == nil && info.Size() > limit+int64(len(frame)) {
+			t.Fatalf("edit %d: log exceeds limit plus one record: %d", line, info.Size())
+		}
+	}
+	if merges < 2 {
+		t.Fatalf("repeated edits merged only %d times", merges)
+	}
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	symbols, err := reloaded.LookupSymbol(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(symbols) != 1 || symbols[0].Line != 100 {
+		t.Fatalf("latest edit lost after merging: %+v", symbols)
 	}
 }
 

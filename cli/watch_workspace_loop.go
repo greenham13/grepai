@@ -69,31 +69,6 @@ func projectsWithoutLiveWatch(runtimes map[string]*workspaceProjectRuntime) []*w
 	return stale
 }
 
-// rescanProjectsWithoutLiveWatch re-runs the initial scan for projects that
-// have no live watcher. Unchanged files are skipped by hash, so this costs a
-// metadata walk per project, not a re-embedding.
-func rescanProjectsWithoutLiveWatch(ctx context.Context, fence *watchMutationFence, runtimes map[string]*workspaceProjectRuntime) error {
-	stale := projectsWithoutLiveWatch(runtimes)
-	if len(stale) == 0 {
-		return nil
-	}
-	return fence.handle(ctx, func(scanCtx context.Context) {
-		for _, runtime := range stale {
-			if runtime.idx == nil {
-				continue
-			}
-			stats, err := runtime.idx.IndexAll(scanCtx)
-			if err != nil {
-				log.Printf("Warning: rescan of %s (no live file watching) failed: %v", runtime.project.Name, err)
-				continue
-			}
-			if stats.FilesIndexed > 0 || stats.FilesRemoved > 0 {
-				log.Printf("Rescanned %s (no live file watching): %d files indexed, %d removed", runtime.project.Name, stats.FilesIndexed, stats.FilesRemoved)
-			}
-		}
-	})
-}
-
 func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 	if l.persistence == nil {
 		l.persistence = newWorkspacePersistence(30 * time.Second)

@@ -31,7 +31,7 @@ const symbolLogMagic = "GREPAI-SYMLOG\x01"
 
 var (
 	// The log is folded into a new base once it outgrows both limits.
-	symbolLogCompactMinBytes int64 = 16 << 20
+	symbolLogCompactMinBytes int64 = 1 << 20
 	symbolLogCompactDivisor  int64 = 4
 
 	symbolLogCRC = crc32.MakeTable(crc32.Castagnoli)
