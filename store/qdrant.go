@@ -314,7 +314,13 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 		return nil, fmt.Errorf("limit must be positive, got: %d", limit)
 	}
 
-	// Fetch more results to account for filtering by path prefix
+	// file_path has a keyword index, not a full-text index: MatchText is a
+	// case-sensitive substring filter. Keep the exact prefix check below.
+	// Filtering before ranking prevents unrelated projects consuming the limit.
+	var filter *qdrant.Filter
+	if opts.PathPrefix != "" {
+		filter = &qdrant.Filter{Must: []*qdrant.Condition{qdrant.NewMatchText("file_path", opts.PathPrefix)}}
+	}
 	fetchLimit := limit
 	if opts.PathPrefix != "" {
 		// Fetch 2x the limit to allow for filtering
@@ -333,6 +339,7 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 	searchResult, err := s.client.Query(ctx, &qdrant.QueryPoints{
 		CollectionName: s.collectionName,
 		Query:          qdrant.NewQuery(queryVector...),
+		Filter:         filter,
 		Limit:          qdrant.PtrOf(fetchLimitU64),
 		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
 	})
