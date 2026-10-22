@@ -1454,6 +1454,7 @@ type dynamicWatchSupervisorConfig struct {
 	initialLinkedWorktree []string
 	discoverWorktrees     func(projectRoot string) []string
 	sessionRunner         watchSupervisorSessionRunner
+	startupWiring         watchProjectStartupWiring
 	lifecycleObserver     watchSessionLifecycleObserver
 	eventObserver         watchSessionEventObserver
 	scanObserver          func(current, total int, file string)
@@ -1633,6 +1634,7 @@ type watchActivityObserver func(state, file string)
 type watchStatsObserver func(projectRoot string, delta watchStatsDelta)
 
 func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedder.Embedder, opts ...dynamicWatchSupervisorOption) error {
+	mainRoot = canonicalPath(mainRoot)
 	cfg := newDynamicWatchSupervisorConfig()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -1676,7 +1678,9 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			if onEvent != nil {
 				observer = watchEventObserver(onEvent)
 			}
-			return watchProjectWithEventObserverAndFence(ctx, projectRoot, emb, isBackgroundChild, onReady, observer, onScan, onEmbed, onRPG, onActivity, onStats, cfg.fatalObserver, mutationFence)
+			return runProjectWatchWithWriterLock(projectRoot, func(canonicalRoot string) error {
+				return watchProjectWithEventObserverAndFence(ctx, canonicalRoot, emb, isBackgroundChild, onReady, observer, onScan, onEmbed, onRPG, onActivity, onStats, cfg.fatalObserver, mutationFence, cfg.startupWiring)
+			})
 		}
 	}
 	if cfg.reconcileInterval <= 0 {
