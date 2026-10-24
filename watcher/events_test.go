@@ -3,6 +3,7 @@ package watcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -150,6 +151,55 @@ func TestFullEventQueueAppliesBackpressure(t *testing.T) {
 		default:
 		}
 	})
+}
+
+// TestConcurrentFlushesPreserveEventOrder checks that while the queue is full,
+// a newer flush cannot deliver its events before an older, still-blocked flush:
+// otherwise a stale delete could land after a re-create and drop a file that
+// exists from the index.
+func TestConcurrentFlushesPreserveEventOrder(t *testing.T) {
+	for trial := 0; trial < 50; trial++ {
+		w := &Watcher{
+			events:  make(chan FileEvent, 100),
+			errors:  make(chan error, 1),
+			done:    make(chan struct{}),
+			pending: make(map[string]FileEvent),
+		}
+		for i := 0; i < 150; i++ {
+			path := fmt.Sprintf("file%d", i)
+			w.pending[path] = FileEvent{Type: EventModify, Path: path}
+		}
+		w.pending["target"] = FileEvent{Type: EventDelete, Path: "target"}
+		total := len(w.pending) + 1
+
+		go w.flush()
+		for len(w.events) < cap(w.events) {
+			time.Sleep(time.Microsecond)
+		}
+		w.pendingMu.Lock()
+		w.pending["target"] = FileEvent{Type: EventCreate, Path: "target"}
+		w.pendingMu.Unlock()
+		go w.flush()
+		time.Sleep(time.Millisecond)
+
+		deadline := time.NewTimer(2 * time.Second)
+		var last EventType
+		for i := 0; i < total; i++ {
+			select {
+			case event := <-w.Events():
+				if event.Path == "target" {
+					last = event.Type
+				}
+			case <-deadline.C:
+				t.Fatalf("trial %d: only received %d of %d events", trial, i, total)
+			}
+		}
+		deadline.Stop()
+		close(w.done)
+		if last != EventCreate {
+			t.Fatalf("trial %d: last event for target = %v, want create", trial, last)
+		}
+	}
 }
 
 func TestUnexpectedBackendChannelClosureIsFatal(t *testing.T) {

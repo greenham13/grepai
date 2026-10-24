@@ -128,6 +128,9 @@ func (w *Watcher) debounceEvent(event FileEvent) {
 }
 
 func (w *Watcher) flush() {
+	w.flushMu.Lock()
+	defer w.flushMu.Unlock()
+
 	w.pendingMu.Lock()
 	events := make([]FileEvent, 0, len(w.pending))
 	for _, event := range w.pending {
