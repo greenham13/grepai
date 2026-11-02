@@ -49,6 +49,13 @@ func (l *workspaceWatchLoop) gracefulShutdown(message string) error {
 		log.Println(message)
 	}
 	l.stopWorkersAndWait()
+	if err := l.fence.workerFailure(); err != nil {
+		l.fence.failWithCause(err, func() { abortWatchSources(l.watchers) }, l.withdrawReadiness)
+		if l.stopForwarders != nil {
+			l.stopForwarders()
+		}
+		return err
+	}
 	l.fence.cleanup(l.ctx, func() {
 		batch := l.persistence.take()
 		if len(batch) > 0 {
@@ -102,6 +109,12 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 			case l.reconcileStale <- struct{}{}:
 			default:
 			}
+		case err := <-l.fence.workerErrors:
+			l.fence.failWithCause(err, func() { abortWatchSources(l.watchers) }, l.withdrawReadiness)
+			if l.stopForwarders != nil {
+				l.stopForwarders()
+			}
+			return err
 		case err := <-l.fatals:
 			if l.stopForwarders != nil {
 				l.stopForwarders()
@@ -113,8 +126,9 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 				log.Printf("Warning: received event for unknown runtime: %s", event.projectPath)
 				continue
 			}
+			var eventErr error
 			if err := l.fence.handle(l.ctx, func(eventCtx context.Context) {
-				handleFileEvent(
+				eventErr = handleFileEvent(
 					eventCtx, runtime.idx, runtime.scanner, runtime.extractor,
 					runtime.symbolStore, runtime.rpgEncoder, runtime.vectorStore,
 					runtime.tracedLanguages, runtime.project.Path, runtime.cfg,
@@ -131,6 +145,13 @@ func runWorkspaceWatchLoop(l *workspaceWatchLoop) error {
 					l.stopForwarders()
 				}
 				return fatal
+			}
+			if eventErr != nil {
+				l.fence.failWithCause(eventErr, func() { abortWatchSources(l.watchers) }, l.withdrawReadiness)
+				if l.stopForwarders != nil {
+					l.stopForwarders()
+				}
+				return eventErr
 			}
 		}
 	}

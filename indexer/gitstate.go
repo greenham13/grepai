@@ -100,7 +100,7 @@ func (idx *Indexer) CanSkipReconciliationWithDocuments(ctx context.Context, list
 		return "", false
 	}
 	current, err := ReadGitScanState(ctx, idx.root)
-	current.Scope = idx.reconcileScope
+	current.Scope = idx.reconciliationScope()
 	if err != nil || current != previous {
 		return "", false
 	}
@@ -110,6 +110,12 @@ func (idx *Indexer) CanSkipReconciliationWithDocuments(ctx context.Context, list
 	}
 	present := make(map[string]bool, len(documents))
 	for _, path := range documents {
+		if idx.scanner.ignore.policy != nil {
+			excluded, err := idx.scanner.ignore.policyExcluded(path)
+			if err != nil || excluded {
+				return "", false
+			}
+		}
 		present[path] = true
 	}
 	s.mu.Lock()
@@ -136,7 +142,7 @@ func (idx *Indexer) CompleteGitScan(ctx context.Context, before GitScanState) er
 		return nil
 	}
 	idx.snapshot.mu.Lock()
-	after.Scope = idx.reconcileScope
+	after.Scope = idx.reconciliationScope()
 	idx.snapshot.gitState = after
 	idx.snapshot.markDirty()
 	idx.snapshot.mu.Unlock()

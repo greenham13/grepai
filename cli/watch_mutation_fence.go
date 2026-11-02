@@ -20,6 +20,8 @@ type watchMutationFence struct {
 	active        int
 	idle          chan struct{}
 	failed        chan struct{}
+	workerErrors  chan error
+	reportedError error
 	nextID        uint64
 	cancellations map[uint64]context.CancelCauseFunc
 }
@@ -62,6 +64,9 @@ func newWatchMutationFence() *watchMutationFence {
 }
 
 func (f *watchMutationFence) initializeLocked() {
+	if f.workerErrors == nil {
+		f.workerErrors = make(chan error, 1)
+	}
 	if f.idle == nil {
 		f.idle = make(chan struct{})
 		close(f.idle)
@@ -100,6 +105,9 @@ func (f *watchMutationFence) ready(publish func() error) error {
 	if f.closed {
 		return f.closedErrorLocked()
 	}
+	if f.reportedError != nil {
+		return f.reportedError
+	}
 	return withWatchSourcesReady(f.watchers, publish)
 }
 
@@ -112,6 +120,9 @@ func (f *watchMutationFence) publishReadiness(publish func() error) error {
 	if f.closed {
 		return nil
 	}
+	if f.reportedError != nil {
+		return f.reportedError
+	}
 	return withWatchSourcesReady(f.watchers, publish)
 }
 
@@ -120,6 +131,11 @@ func (f *watchMutationFence) admit(parent context.Context) (context.Context, fun
 	f.initializeLocked()
 	if f.closed {
 		err := f.closedErrorLocked()
+		f.mu.Unlock()
+		return nil, nil, err
+	}
+	if f.reportedError != nil {
+		err := f.reportedError
 		f.mu.Unlock()
 		return nil, nil, err
 	}
@@ -178,7 +194,7 @@ func (f *watchMutationFence) handle(parent context.Context, mutate func(context.
 func (f *watchMutationFence) cleanup(parent context.Context, cleanup func()) {
 	f.mu.Lock()
 	f.initializeLocked()
-	if f.closed || isFatalWatcherError(context.Cause(parent)) {
+	if f.closed || f.reportedError != nil || isFatalWatcherError(context.Cause(parent)) {
 		f.mu.Unlock()
 		return
 	}

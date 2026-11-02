@@ -218,8 +218,17 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 	}
 
+	// Validate every cleanup candidate before deleting any of them.
+	for path := range existingMap {
+		if _, err := idx.scanner.AllowsPath(path); err != nil {
+			return nil, err
+		}
+	}
 	// Remove deleted files
 	for path := range existingMap {
+		if _, err := idx.scanner.AllowsPath(path); err != nil {
+			return nil, err
+		}
 		if err := idx.RemoveFile(ctx, path); err != nil {
 			log.Printf("Failed to remove %s: %v", path, err)
 			continue
@@ -256,6 +265,13 @@ func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (file
 }
 
 func (idx *Indexer) decideFileScanChecked(ctx context.Context, fileMeta FileMeta, strict bool) (fileScanDecision, error) {
+	allowed, policyErr := idx.scanner.AllowsPath(fileMeta.Path)
+	if policyErr != nil {
+		return fileScanDecision{}, policyErr
+	}
+	if !allowed {
+		return fileScanDecision{countAsSkipped: true}, nil
+	}
 	entry, hadSnapshot := idx.snapshot.get(fileMeta.Path)
 	if hadSnapshot && entry.ModTime == fileMeta.ModTimeNano && entry.Size == fileMeta.Size && entry.Chunks > 0 {
 		return fileScanDecision{countAsSkipped: true}, nil
@@ -283,7 +299,7 @@ func (idx *Indexer) decideFileScanChecked(ctx context.Context, fileMeta FileMeta
 	// Load file content and hash only after metadata filtering.
 	file, err := idx.scanner.ScanFile(fileMeta.Path)
 	if err != nil {
-		if strict {
+		if strict || IsPathPolicyError(err) {
 			return fileScanDecision{}, err
 		}
 		log.Printf("Failed to scan %s: %v", fileMeta.Path, err)

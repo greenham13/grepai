@@ -29,11 +29,16 @@ func startWorkspaceProjectWriter(ctx context.Context, fence *watchMutationFence,
 		if runtime.watcher != nil {
 			events = runtime.watcher.Events()
 		}
-		handle := func(event watcher.FileEvent) {
-			handleFileEvent(ctx, runtime.idx, runtime.scanner, runtime.extractor,
+		handle := func(event watcher.FileEvent) bool {
+			err := handleFileEvent(ctx, runtime.idx, runtime.scanner, runtime.extractor,
 				runtime.symbolStore, runtime.rpgEncoder, runtime.vectorStore,
 				runtime.tracedLanguages, runtime.project.Path, runtime.cfg,
 				&runtime.lastConfigWrite, runtime.manager, event, nil, nil, runtime.processor)
+			if err != nil {
+				fence.reportWorkerError(err)
+				return false
+			}
+			return true
 		}
 		for {
 			if ctx.Err() != nil {
@@ -45,7 +50,9 @@ func startWorkspaceProjectWriter(ctx context.Context, fence *watchMutationFence,
 				if !ok {
 					events = nil
 				} else {
-					handle(event)
+					if !handle(event) {
+						return
+					}
 				}
 				continue
 			default:
@@ -57,7 +64,9 @@ func startWorkspaceProjectWriter(ctx context.Context, fence *watchMutationFence,
 				if !ok {
 					events = nil
 				} else {
-					handle(event)
+					if !handle(event) {
+						return
+					}
 				}
 			case op := <-runtime.reconcileOps:
 				// An event may have arrived alongside the request. Let it go first.
@@ -67,7 +76,9 @@ func startWorkspaceProjectWriter(ctx context.Context, fence *watchMutationFence,
 						if !ok {
 							events = nil
 						} else {
-							handle(event)
+							if !handle(event) {
+								return
+							}
 						}
 					default:
 						goto drained
@@ -80,7 +91,10 @@ func startWorkspaceProjectWriter(ctx context.Context, fence *watchMutationFence,
 				if ctx.Err() != nil {
 					return
 				}
-				op.done <- op.run()
+				err := op.run()
+				// The caller may already have returned on cancellation.
+				reportPolicyWalkError(fence, runtime.project.Path, err)
+				op.done <- err
 			}
 		}
 	})
@@ -258,10 +272,12 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 	sort.Slice(projects, func(i, j int) bool { return projects[i].project.Name < projects[j].project.Name })
 	stale := projectsWithoutLiveWatch(runtimes)
 	return startWatchMutationWorker(ctx, fence, func(ctx context.Context) {
-		runSharedStartupReconciliation(ctx, projects,
+		list := newSharedDocumentList(shared)
+		runStartupReconciliation(ctx, projects,
 			reconcileDuration("GREPAI_STARTUP_RECONCILE_DELAY", 15*time.Second),
 			reconcileDuration("GREPAI_STARTUP_RECONCILE_PACE", 250*time.Millisecond),
-			shared)
+			workspaceReconciliationSkipperWithList(list), policyWalk(fence, workspaceReconciliationWalker(list)))
+		list.release()
 		for {
 			select {
 			case <-ctx.Done():
@@ -270,7 +286,7 @@ func startWorkspaceReconciliation(ctx context.Context, fence *watchMutationFence
 				runStartupReconciliation(ctx, stale, 0,
 					reconcileDuration("GREPAI_STARTUP_RECONCILE_PACE", 250*time.Millisecond),
 					func(context.Context, *workspaceProjectRuntime) (string, bool) { return "", false },
-					reconcileWorkspaceProject)
+					policyWalk(fence, reconcileWorkspaceProject))
 			}
 		}
 	})
@@ -321,6 +337,9 @@ func reconcileWorkspaceProjectWithDocuments(ctx context.Context, r *workspacePro
 		return err
 	}
 	err = apply(func() error {
+		if err := reconcileSymbolScope(ctx, r.scanner, r.symbolStore); err != nil {
+			return err
+		}
 		if err := r.symbolStore.Persist(ctx); err != nil {
 			return err
 		}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/indexer"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/watcher"
 )
@@ -85,7 +86,7 @@ func (e *workspaceWatcherError) Unwrap() error { return e.Cause }
 func isFatalWatcherError(err error) bool {
 	var registrationErr *watcher.RegistrationError
 	var fatalErr *watcher.FatalError
-	return errors.As(err, &registrationErr) || errors.As(err, &fatalErr)
+	return errors.As(err, &registrationErr) || errors.As(err, &fatalErr) || indexer.IsPathPolicyError(err)
 }
 
 func forwardWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRuntime, events chan<- workspaceWatchEvent) {
@@ -133,6 +134,10 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 		}
 		runtime, w, err := initialize(ctx, ws, project, emb, sharedStore, backend, isBackgroundChild)
 		if err != nil {
+			if indexer.IsPathPolicyError(err) {
+				abortWatchSources(watchers)
+				return runtimes, watchers, err
+			}
 			if runtime == nil {
 				log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
 				continue

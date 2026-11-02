@@ -45,6 +45,7 @@ type grepaiMatcher struct {
 }
 
 type IgnoreMatcher struct {
+	policy             PathPolicy
 	projectRoot        string
 	nestedMatchers     []nestedMatcher // .gitignore matchers
 	extraDirs          []string        // patterns from config
@@ -64,7 +65,12 @@ type IgnoreMatcher struct {
 }
 
 func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignore string) (*IgnoreMatcher, error) {
+	policy, policyErr := newPathPolicy(projectRoot)
+	if policyErr != nil {
+		return nil, policyErr
+	}
 	m := &IgnoreMatcher{
+		policy:      policy,
 		projectRoot: projectRoot,
 		extraDirs:   extraIgnore,
 	}
@@ -95,7 +101,28 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 	// Walk the project to find all .gitignore and .grepaiignore files
 	err := filepath.Walk(projectRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
+			if path != projectRoot && os.IsNotExist(err) {
+				return nil
+			}
+			if m.policy != nil {
+				return &PathPolicyError{Root: projectRoot, Path: path, Err: err}
+			}
 			return nil // Skip inaccessible paths
+		}
+
+		rel, relErr := filepath.Rel(projectRoot, path)
+		if relErr != nil {
+			return relErr
+		}
+		excluded, policyErr := m.policyExcluded(rel)
+		if policyErr != nil {
+			return policyErr
+		}
+		if excluded {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
 		// Skip directories that should be ignored by default
@@ -192,7 +219,7 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 	return m, nil
 }
 
-func (m *IgnoreMatcher) ShouldIgnore(path string) bool {
+func (m *IgnoreMatcher) shouldIgnore(path string) bool {
 	// The root directory itself ("." from filepath.Rel) must never be ignored.
 	// Patterns like ".*/" would otherwise match "." and cause the entire
 	// directory tree to be skipped.
@@ -228,8 +255,8 @@ func (m *IgnoreMatcher) ShouldIgnore(path string) bool {
 // ShouldSkipDir determines if a directory can be skipped entirely via filepath.SkipDir.
 // If .grepaiignore has negation patterns, we must descend into ignored directories
 // because individual files inside may be re-included.
-func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
-	if !m.ShouldIgnore(path) {
+func (m *IgnoreMatcher) shouldSkipDir(path string) bool {
+	if !m.shouldIgnore(path) {
 		return false // Not ignored, don't skip
 	}
 

@@ -50,6 +50,13 @@ func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(contex
 			return nil, err
 		}
 		err := apply(func() error {
+			allowed, err := idx.scanner.AllowsPath(meta.Path)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return nil
+			}
 			info, err := os.Stat(filepath.Join(idx.root, meta.Path))
 			if os.IsNotExist(err) {
 				return nil
@@ -82,17 +89,28 @@ func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(contex
 		}
 	}
 	for path := range present {
+		if idx.scanner != nil {
+			if _, err := idx.scanner.AllowsPath(path); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for path := range present {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		err := apply(func() error {
 			// A file created after enumeration must not be removed by this old walk
 			// if the scanner would still enumerate it.
-			if _, err := os.Stat(filepath.Join(idx.root, path)); err == nil {
-				if idx.scanner != nil && idx.scanner.ShouldIndex(path) {
+			if idx.scanner != nil {
+				keep, err := idx.scanner.ShouldIndexChecked(path)
+				if err != nil {
+					return err
+				}
+				if keep {
 					return nil
 				}
-			} else if !os.IsNotExist(err) {
+			} else if _, err := os.Stat(filepath.Join(idx.root, path)); err != nil && !os.IsNotExist(err) {
 				return err
 			}
 			if err := idx.RemoveFile(ctx, path); err != nil {

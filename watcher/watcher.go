@@ -246,11 +246,19 @@ func (w *Watcher) addRecursive(root string, rootRequired bool) error {
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
-			if w.ignore.ShouldSkipDir(relPath) {
+			skip, policyErr := w.ignore.ShouldSkipDirChecked(relPath)
+			if policyErr != nil {
+				return &RegistrationError{Operation: "check path policy", Path: path, Cause: policyErr}
+			}
+			if skip {
 				return filepath.SkipDir
 			}
 			// Directory is not skipped; watch it if not individually ignored
-			if !w.ignore.ShouldIgnore(relPath) {
+			ignored, policyErr := w.ignore.ShouldIgnoreChecked(relPath)
+			if policyErr != nil {
+				return &RegistrationError{Operation: "check path policy", Path: path, Cause: policyErr}
+			}
+			if !ignored {
 				if err := w.addWatch(path); err != nil {
 					if os.IsNotExist(err) && (!rootRequired || path != root) {
 						return nil
@@ -262,7 +270,11 @@ func (w *Watcher) addRecursive(root string, rootRequired bool) error {
 		}
 
 		// Skip ignored files
-		if w.ignore.ShouldIgnore(relPath) {
+		ignored, policyErr := w.ignore.ShouldIgnoreChecked(relPath)
+		if policyErr != nil {
+			return &RegistrationError{Operation: "check path policy", Path: path, Cause: policyErr}
+		}
+		if ignored {
 			return nil
 		}
 

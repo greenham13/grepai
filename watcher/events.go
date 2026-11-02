@@ -73,7 +73,11 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 		return &FatalError{Operation: "watch root", Path: w.root, Cause: errWatchRootLost}
 	}
 
-	if strings.HasPrefix(filepath.Base(relPath), ".") || w.ignore.ShouldIgnore(relPath) {
+	ignored, policyErr := w.ignore.ShouldIgnoreChecked(relPath)
+	if policyErr != nil {
+		return &FatalError{Operation: "check path policy", Path: event.Name, Cause: policyErr}
+	}
+	if strings.HasPrefix(filepath.Base(relPath), ".") || ignored {
 		return nil
 	}
 

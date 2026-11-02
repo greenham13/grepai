@@ -158,22 +158,26 @@ func (s *Scanner) isSupported(ext string) bool {
 // ShouldIndex reports whether scanMetadata would enumerate an existing file.
 // relPath is relative to the scanner root.
 func (s *Scanner) ShouldIndex(relPath string) bool {
-	for dir := filepath.Dir(relPath); dir != "."; dir = filepath.Dir(dir) {
-		if s.ignore.ShouldSkipDir(dir) {
-			return false
-		}
+	allowed, err := s.ShouldIndexChecked(relPath)
+	return err == nil && allowed
+}
+
+func (s *Scanner) ShouldIndexChecked(relPath string) (bool, error) {
+	allowed, err := s.AllowsPath(relPath)
+	if err != nil || !allowed {
+		return false, err
 	}
-	if s.ignore.ShouldIgnore(relPath) {
-		return false
-	}
-	if !s.isSupported(strings.ToLower(filepath.Ext(relPath))) {
-		return false
-	}
-	if isMinifiedFile(relPath) {
-		return false
+	if !s.isSupported(strings.ToLower(filepath.Ext(relPath))) || isMinifiedFile(relPath) {
+		return false, nil
 	}
 	info, err := os.Stat(filepath.Join(s.root, relPath))
-	return err == nil && !info.IsDir() && info.Size() <= maxFileSize
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !info.IsDir() && info.Size() <= maxFileSize, nil
 }
 
 // ScanMetadata scans indexable files and returns only file metadata.
@@ -196,6 +200,12 @@ func (s *Scanner) scanMetadata(ctx context.Context, strict bool) ([]FileMeta, []
 			return ctx.Err()
 		}
 		if err != nil {
+			if path != s.root && os.IsNotExist(err) {
+				return nil
+			}
+			if s.ignore != nil && s.ignore.policy != nil {
+				return &PathPolicyError{Root: s.root, Path: path, Err: err}
+			}
 			if strict {
 				return err
 			}
@@ -209,14 +219,22 @@ func (s *Scanner) scanMetadata(ctx context.Context, strict bool) ([]FileMeta, []
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
-			if s.ignore.ShouldSkipDir(relPath) {
+			skip, policyErr := s.ignore.ShouldSkipDirChecked(relPath)
+			if policyErr != nil {
+				return policyErr
+			}
+			if skip {
 				return filepath.SkipDir
 			}
 			return nil // Descend into the directory
 		}
 
 		// Skip ignored files
-		if s.ignore.ShouldIgnore(relPath) {
+		ignored, policyErr := s.ignore.ShouldIgnoreChecked(relPath)
+		if policyErr != nil {
+			return policyErr
+		}
+		if ignored {
 			return nil
 		}
 
@@ -234,6 +252,12 @@ func (s *Scanner) scanMetadata(ctx context.Context, strict bool) ([]FileMeta, []
 
 		info, err := d.Info()
 		if err != nil {
+			if path != s.root && os.IsNotExist(err) {
+				return nil
+			}
+			if s.ignore != nil && s.ignore.policy != nil {
+				return &PathPolicyError{Root: s.root, Path: path, Err: err}
+			}
 			if strict {
 				return err
 			}
@@ -265,6 +289,12 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 
 	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if path != s.root && os.IsNotExist(err) {
+				return nil
+			}
+			if s.ignore != nil && s.ignore.policy != nil {
+				return &PathPolicyError{Root: s.root, Path: path, Err: err}
+			}
 			return nil // Skip files we can't access
 		}
 
@@ -275,14 +305,22 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
 		if d.IsDir() {
-			if s.ignore.ShouldSkipDir(relPath) {
+			skip, policyErr := s.ignore.ShouldSkipDirChecked(relPath)
+			if policyErr != nil {
+				return policyErr
+			}
+			if skip {
 				return filepath.SkipDir
 			}
 			return nil // Descend into the directory
 		}
 
 		// Skip ignored files
-		if s.ignore.ShouldIgnore(relPath) {
+		ignored, policyErr := s.ignore.ShouldIgnoreChecked(relPath)
+		if policyErr != nil {
+			return policyErr
+		}
+		if ignored {
 			return nil
 		}
 
@@ -339,6 +377,10 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 }
 
 func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
+	allowed, err := s.AllowsPath(relPath)
+	if err != nil || !allowed {
+		return nil, err
+	}
 	absPath := filepath.Join(s.root, relPath)
 
 	// Skip minified files

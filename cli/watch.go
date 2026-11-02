@@ -747,7 +747,10 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.
 			}
 
 		case event := <-w.Events():
-			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, nil, nil, tracedLanguages, projectRoot, cfg, &lastConfigWrite, nil, event, nil, nil, processors...)
+			if err := handleFileEvent(ctx, idx, scanner, extractor, symbolStore, nil, nil, tracedLanguages, projectRoot, cfg, &lastConfigWrite, nil, event, nil, nil, processors...); err != nil {
+				w.Abort()
+				return err
+			}
 
 		case err := <-w.Errors():
 			_ = persistAndExit()
@@ -818,6 +821,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	} else {
 		log.Println("Building symbol index...")
 	}
+	if err := reconcileSymbolScope(ctx, scanner, symbolStore); err != nil {
+		return nil, err
+	}
 	symbolCount := 0
 	files := stats.ScannedFiles
 
@@ -846,6 +852,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 
 		fileInfo, err := scanner.ScanFile(file.Path)
 		if err != nil {
+			if indexer.IsPathPolicyError(err) {
+				return nil, err
+			}
 			log.Printf("Warning: failed to scan %s for symbols: %v", file.Path, err)
 			continue
 		}
@@ -1100,6 +1109,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	// Initialize ignore matcher
 	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, cfg.Ignore, cfg.ExternalGitignore)
 	if err != nil {
+		abortStores = isFatalWatcherError(err)
 		return fmt.Errorf("failed to initialize ignore matcher: %w", err)
 	}
 
@@ -1177,6 +1187,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	stats, err := runInitialScan(startupCtx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, isBackgroundChild, onScan, onEmbed, processorRegistry)
 	if err != nil {
+		abortStores = isFatalWatcherError(err)
 		if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
 			return cause
 		}
@@ -1390,11 +1401,12 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 			}
 
 		case event := <-w.Events():
+			var eventErr error
 			if err := mutationFence.handle(ctx, func(eventCtx context.Context) {
 				if onEvent != nil {
 					onEvent(projectRoot, event)
 				}
-				handleFileEvent(eventCtx, idx, scanner, extractor, symbolStore, rpgEncoder, st, tracedLanguages, projectRoot, cfg, &lastConfigWrite, rpgManager, event, onActivity, onStats, processors...)
+				eventErr = handleFileEvent(eventCtx, idx, scanner, extractor, symbolStore, rpgEncoder, st, tracedLanguages, projectRoot, cfg, &lastConfigWrite, rpgManager, event, onActivity, onStats, processors...)
 			}); err != nil {
 				if ctx.Err() != nil {
 					persistAndShutdown()
@@ -1403,6 +1415,11 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 				primary := fmt.Errorf("filesystem watcher failed during event admission for %s: %w", projectRoot, err)
 				mutationFence.failWithCause(primary, w.Abort, onFatal)
 				return primary
+			}
+
+			if eventErr != nil {
+				mutationFence.failWithCause(eventErr, w.Abort, onFatal)
+				return eventErr
 			}
 
 		case err := <-fatalChan:
@@ -2327,8 +2344,19 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 	return symbols, refs, nil
 }
 
-func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
-	defer persistScanSnapshot(ctx, idx, false)
+func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) (eventErr error) {
+	allowed, err := scanner.AllowsPath(event.Path)
+	if err != nil {
+		return &watcher.FatalError{Operation: "check queued file policy", Path: event.Path, Cause: err}
+	}
+	if !allowed {
+		return nil
+	}
+	defer func() {
+		if eventErr == nil {
+			persistScanSnapshot(ctx, idx, false)
+		}
+	}()
 	// An atomic write -- write to a temp file, then rename it over the target
 	// -- surfaces on the destination path as RENAME/REMOVE with no follow-up
 	// CREATE or WRITE. Editors and coding agents (Claude Code, Cursor) save
@@ -2375,6 +2403,9 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 		start := time.Now()
 		fileInfo, err := scanner.ScanFile(event.Path)
 		if err != nil {
+			if indexer.IsPathPolicyError(err) {
+				return &watcher.FatalError{Operation: "scan queued file", Path: event.Path, Cause: err}
+			}
 			log.Printf("Failed to scan %s: %v", event.Path, err)
 			return
 		}
@@ -2504,6 +2535,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 		}
 		log.Printf("Removed %s from index", event.Path)
 	}
+	return nil
 }
 
 // isTracedLanguage checks if a file extension is in the enabled languages list.

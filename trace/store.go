@@ -1016,6 +1016,18 @@ func (s *GOBSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	}, nil
 }
 
+// IndexedFiles returns a snapshot of file membership for reconciliation.
+func (s *GOBSymbolStore) IndexedFiles() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	files := make([]string, 0, len(s.fileIndex))
+	for path := range s.fileIndex {
+		files = append(files, path)
+	}
+	sort.Strings(files)
+	return files
+}
+
 // IsFileIndexed checks if a file has been indexed.
 func (s *GOBSymbolStore) IsFileIndexed(filePath string) bool {
 	s.mu.RLock()
