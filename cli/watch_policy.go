@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"log"
+
 	"github.com/yoanbernabeu/grepai/indexer"
 	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
@@ -68,6 +70,20 @@ func reconcileSymbolScope(ctx context.Context, scanner *indexer.Scanner, symbols
 		}
 	}
 	return nil
+}
+
+// compactSparseSymbolStore shrinks a base whose entries were mostly pruned
+// through the log, so the next start does not decode them again. A failure
+// leaves the loaded store intact; the next persist retries.
+func compactSparseSymbolStore(ctx context.Context, symbols *trace.GOBSymbolStore, root string) {
+	compacted, err := symbols.CompactIfSparse(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to compact symbol index for %s: %v", root, err)
+		return
+	}
+	if compacted {
+		log.Printf("Compacted symbol index for %s: removed entries exceeded a quarter of the stored base", root)
+	}
 }
 
 func policyWalk(fence *watchMutationFence, walk func(context.Context, *workspaceProjectRuntime) error) func(context.Context, *workspaceProjectRuntime) error {

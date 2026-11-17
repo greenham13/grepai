@@ -65,6 +65,10 @@ type GOBSymbolStore struct {
 	// baseStamp identifies the base file this store last read or wrote, so
 	// a base replaced by another process is never extended with our log.
 	baseStamp fileStamp
+	// baseEntries is the symbol+reference count the base on disk holds.
+	// Deletes append tiny log frames, so the log-size rule alone never
+	// shrinks a base after a large prune; see sparseUnlocked.
+	baseEntries int
 
 	// removalVisits counts entries examined while removing file groups.
 	// It exists so tests can prove a per-file update stays per-file.
@@ -136,6 +140,7 @@ func (s *GOBSymbolStore) resetUnlocked() {
 	s.logID = ""
 	s.logSize = 0
 	s.baseStamp = fileStamp{}
+	s.baseEntries = 0
 	s.invalidateEdgeCache()
 }
 
@@ -199,6 +204,7 @@ func (s *GOBSymbolStore) loadUnlocked() (bool, error) {
 	s.resetUnlocked()
 	pool := make(symbolStrings)
 	s.applyBaseUnlocked(&data, pool)
+	s.baseEntries = s.totalSymbols + s.totalRefs
 	s.baseStamp = statStamp(info)
 	s.logID = data.LogID
 	if s.logID != "" {
@@ -287,7 +293,49 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	if !s.constructorPersistPending && len(s.dirty) == 0 {
 		return nil
 	}
+	return s.withDiskLockUnlocked(s.persistUnlocked)
+}
 
+// CompactIfSparse rewrites the base when more than a quarter of the
+// entries it holds have since been removed, even with nothing dirty. A
+// writer calls it after Load: deletes replayed from the log shrink memory
+// but not the file, and every start would decode the old base in full.
+// Readers never call it, so a trace query never rewrites the store.
+func (s *GOBSymbolStore) CompactIfSparse(ctx context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.sparseUnlocked() {
+		return false, nil
+	}
+	compacted := false
+	err := s.withDiskLockUnlocked(func() error {
+		if !s.canAppendUnlocked() {
+			// Another writer replaced the base; merge its state first.
+			if err := s.reloadForMergeUnlocked(); err != nil {
+				return err
+			}
+			if !s.sparseUnlocked() {
+				return nil
+			}
+		}
+		compacted = true
+		return s.compactUnlocked(s.now())
+	})
+	return compacted, err
+}
+
+// sparseUnlocked reports whether removals since the base was written exceed
+// a quarter of its entries. Bases under the log's minimum size are left to
+// the log-size rule; rewriting them saves nothing measurable.
+func (s *GOBSymbolStore) sparseUnlocked() bool {
+	if !s.baseStamp.valid || s.baseStamp.size < symbolLogCompactMinBytes || s.baseEntries <= 0 {
+		return false
+	}
+	removed := s.baseEntries - (s.totalSymbols + s.totalRefs)
+	return int64(removed)*symbolLogCompactDivisor > int64(s.baseEntries)
+}
+
+func (s *GOBSymbolStore) withDiskLockUnlocked(fn func() error) error {
 	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
 		return fmt.Errorf("failed to prepare symbol index directory: %w", err)
 	}
@@ -304,7 +352,7 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 		_ = fileutil.Funlock(lockFile)
 	}()
 
-	return s.persistUnlocked()
+	return fn()
 }
 
 func (s *GOBSymbolStore) persistUnlocked() error {
@@ -315,7 +363,7 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 		if err != nil {
 			return err
 		}
-		if !s.logTooLargeUnlocked(int64(len(batch))) {
+		if !s.logTooLargeUnlocked(int64(len(batch))) && !s.sparseUnlocked() {
 			if err := s.appendLogUnlocked(batch); err != nil {
 				return err
 			}
@@ -413,6 +461,7 @@ func (s *GOBSymbolStore) compactUnlocked(now time.Time) error {
 		s.baseStamp = statStamp(info)
 	}
 	s.logID = logID
+	s.baseEntries = s.totalSymbols + s.totalRefs
 	// The old log names the previous base, so it can never be replayed on
 	// this one. Removing it only reclaims space; if removal fails the next
 	// append truncates it (logSize 0 forces a fresh header).

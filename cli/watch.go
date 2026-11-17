@@ -1128,6 +1128,8 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
 	if err := symbolStore.Load(startupCtx); err != nil {
 		log.Printf("Warning: failed to load symbol index for %s: %v", projectRoot, err)
+	} else {
+		compactSparseSymbolStore(startupCtx, symbolStore, projectRoot)
 	}
 	defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, symbolStore.Close) }()
 	if err := startupCtx.Err(); err != nil {
@@ -3156,6 +3158,8 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	if err := symbolStore.Load(ctx); err != nil {
 		auxiliaryIndexesLoaded = false
 		log.Printf("Warning: failed to load symbol index for %s: %v", project.Path, err)
+	} else {
+		compactSparseSymbolStore(ctx, symbolStore, project.Path)
 	}
 
 	tracedLanguages := projectCfg.Trace.EnabledLanguages

@@ -30,7 +30,8 @@ import (
 const symbolLogMagic = "GREPAI-SYMLOG\x01"
 
 var (
-	// The log is folded into a new base once it outgrows both limits.
+	// The log is folded into a new base once it outgrows both limits, or
+	// once removals exceed 1/symbolLogCompactDivisor of the base's entries.
 	symbolLogCompactMinBytes int64 = 1 << 20
 	symbolLogCompactDivisor  int64 = 4
 
@@ -154,6 +155,7 @@ func (s *GOBSymbolStore) reloadForMergeUnlocked() error {
 	s.fileContentHashes, s.fileExtractorVersions = fresh.fileContentHashes, fresh.fileExtractorVersions
 	s.updatedAt, s.version = fresh.updatedAt, fresh.version
 	s.logID, s.logSize, s.baseStamp = fresh.logID, fresh.logSize, fresh.baseStamp
+	s.baseEntries = fresh.baseEntries
 	s.invalidateEdgeCache()
 	return nil
 }
