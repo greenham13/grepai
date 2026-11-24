@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/embedder"
 	"github.com/yoanbernabeu/grepai/store"
 )
 
@@ -469,5 +471,105 @@ func TestReconcileGitFastPathWithUntrackedConfigDir(t *testing.T) {
 	}
 	if _, skip := idx.CanSkipReconciliation(context.Background()); !skip {
 		t.Fatal("receipt stored in the untracked config dir did not authorize a skip")
+	}
+}
+
+// poisonEmbedder rejects any text containing poisonMarker the way Ollama
+// rejects an input longer than the model context. Every re-chunked piece of a
+// file made only of the marker still contains it, so re-chunking never helps.
+type poisonEmbedder struct {
+	mockEmbedder
+	onPoison func(context.Context) error
+}
+
+const poisonMarker = "POISON"
+
+func (p *poisonEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	for i, text := range texts {
+		if strings.Contains(text, poisonMarker) {
+			if p.onPoison != nil {
+				return nil, p.onPoison(ctx)
+			}
+			return nil, embedder.NewContextLengthError(i, 9000, 8192, "input length exceeds the context length")
+		}
+	}
+	return p.mockEmbedder.EmbedBatch(ctx, texts)
+}
+
+func TestReconcileSkipsFileThatCannotBeEmbedded(t *testing.T) {
+	idx, st, _ := gitReconcileFixtureFiles(t, map[string]string{
+		".gitignore": ".grepai/\n",
+		"a.go":       "package main\nfunc a() {}\n",
+		"bad.go":     strings.Repeat(poisonMarker+" ", 1500) + "\n",
+		"z.go":       "package main\nfunc z() {}\n",
+	})
+	idx.embedder = &poisonEmbedder{}
+	var visited []string
+	stats, err := idx.Reconcile(context.Background(), func(run func() error) error { return run() },
+		func(path string, _ *FileMeta, _ bool) error { visited = append(visited, path); return nil })
+	if err != nil {
+		t.Fatalf("one unembeddable file aborted the walk: %v", err)
+	}
+	if stats.FilesFailed != 1 || stats.FilesIndexed != 2 {
+		t.Fatalf("stats: indexed=%d failed=%d, want indexed=2 (a.go, z.go) failed=1", stats.FilesIndexed, stats.FilesFailed)
+	}
+	for _, path := range []string{"a.go", "z.go"} {
+		if _, ok := st.documents[path]; !ok {
+			t.Errorf("%s was not indexed", path)
+		}
+	}
+	if _, ok := st.documents["bad.go"]; ok {
+		t.Error("bad.go has a document despite failing to embed")
+	}
+	if len(visited) != 3 {
+		t.Errorf("onFile visited %v, want a.go, bad.go, z.go", visited)
+	}
+}
+
+func TestReconcileStopsWhenCanceledDuringEmbedding(t *testing.T) {
+	idx, _, _ := gitReconcileFixtureFiles(t, map[string]string{
+		".gitignore": ".grepai/\n",
+		"a.go":       "package main\nfunc a() {}\n",
+		"bad.go":     "package main\n// " + poisonMarker + "\n",
+		"z.go":       "package main\nfunc z() {}\n",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idx.embedder = &poisonEmbedder{onPoison: func(ctx context.Context) error {
+		cancel()
+		return ctx.Err()
+	}}
+	_, err := idx.Reconcile(ctx, func(run func() error) error { return run() }, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled reconcile returned %v, want context.Canceled", err)
+	}
+}
+
+func TestReconcileStopsOnDeadlineErrorFromEmbedder(t *testing.T) {
+	idx, _, _ := gitReconcileFixtureFiles(t, map[string]string{
+		".gitignore": ".grepai/\n",
+		"bad.go":     "package main\n// " + poisonMarker + "\n",
+	})
+	// The embedder's own request deadline, while the walk's context is still live.
+	idx.embedder = &poisonEmbedder{onPoison: func(context.Context) error {
+		return fmt.Errorf("ollama: %w", context.DeadlineExceeded)
+	}}
+	_, err := idx.Reconcile(context.Background(), func(run func() error) error { return run() }, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deadline error was swallowed: %v", err)
+	}
+}
+
+func TestReconcileStopsWhenManyFilesFailInARow(t *testing.T) {
+	files := map[string]string{".gitignore": ".grepai/\n"}
+	for i := 0; i < maxConsecutiveReconcileFailures+2; i++ {
+		files[fmt.Sprintf("bad%d.go", i)] = poisonMarker + "\n"
+	}
+	idx, _, _ := gitReconcileFixtureFiles(t, files)
+	idx.embedder = &poisonEmbedder{}
+	_, err := idx.Reconcile(context.Background(), func(run func() error) error { return run() },
+		func(string, *FileMeta, bool) error { return nil })
+	if err == nil || !strings.Contains(err.Error(), "in a row") {
+		t.Fatalf("a down embedder did not stop the walk: %v", err)
 	}
 }

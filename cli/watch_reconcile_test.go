@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -425,5 +426,50 @@ func TestReconcileVersionBackfillDoesNotRewriteSymbolIndex(t *testing.T) {
 	}
 	if v, ok := reloaded.GetFileExtractorVersion("main.go"); !ok || v != r.extractor.Version() {
 		t.Fatalf("backfilled version lost on reload: %q %v", v, ok)
+	}
+}
+
+type poisonFileEmbedder struct{ noOpEmbedder }
+
+func (e *poisonFileEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	for _, text := range texts {
+		if strings.Contains(text, "POISON") {
+			return nil, errors.New("input length exceeds the context length")
+		}
+	}
+	return e.noOpEmbedder.EmbedBatch(ctx, texts)
+}
+
+// A walk that could not embed a file must not grant the git receipt, or the
+// next start skips the walk and the file stays unindexed until git changes.
+func TestReconcileWithFailedFileWithholdsGitReceipt(t *testing.T) {
+	shared := store.NewGOBStore(filepath.Join(t.TempDir(), "shared.gob"))
+	r := gitReconcileRuntime(t, "project", shared)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, ok := r.idx.CanSkipReconciliation(ctx); !ok {
+		t.Fatal("fixture did not grant a receipt")
+	}
+	root := r.project.Path
+	if err := os.WriteFile(filepath.Join(root, "bad.go"), []byte("package main\n// POISON\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "."}, {"-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", "commit", "-m", "bad"}} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	r.idx = indexer.NewIndexer(root, r.vectorStore, &poisonFileEmbedder{}, indexer.NewChunker(512, 50), r.scanner, time.Time{})
+	writer := startWorkspaceProjectWriter(ctx, newWatchMutationFence(), r)
+	defer func() { cancel(); <-writer.done }()
+	result := make(chan error, 1)
+	go func() { result <- reconcileWorkspaceProject(ctx, r) }()
+	if err := awaitWatchTestValue(t, result, "reconcile with failed file"); err != nil {
+		t.Fatalf("one unembeddable file failed the project walk: %v", err)
+	}
+	if _, ok := r.idx.CanSkipReconciliation(ctx); ok {
+		t.Fatal("walk with a failed file granted a git receipt")
 	}
 }

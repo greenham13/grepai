@@ -2,7 +2,9 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -21,9 +23,14 @@ func (idx *Indexer) Reconcile(ctx context.Context, apply func(func() error) erro
 // shared collection; listing that collection per project (millions of points
 // each time) is what the shared list avoids. list must return paths relative
 // to this root, as the store's own ListDocuments would.
+// maxConsecutiveReconcileFailures ends a reconcile walk when this many files
+// fail in a row, which points at a down embedder or store rather than one file.
+const maxConsecutiveReconcileFailures = 5
+
 func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(context.Context) ([]string, error), apply func(func() error) error, onFile func(string, *FileMeta, bool) error) (*IndexStats, error) {
 	start := time.Now()
 	stats := &IndexStats{}
+	consecutiveFailures := 0
 	if list == nil {
 		list = idx.store.ListDocuments
 	}
@@ -72,10 +79,25 @@ func (idx *Indexer) ReconcileWithDocuments(ctx context.Context, list func(contex
 			if decision.file != nil {
 				chunks, err := idx.IndexFile(ctx, *decision.file)
 				if err != nil {
-					return err
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return err
+					}
+					// One unembeddable file (e.g. a line longer than the model context)
+					// must not abort the walk; the full scan skips it the same way.
+					// Symbols do not depend on embeddings, so onFile still runs.
+					log.Printf("Failed to index %s: %v", meta.Path, err)
+					stats.FilesFailed++
+					consecutiveFailures++
+					// Many failures in a row means the embedder or store is down,
+					// not one bad file: stop instead of paying retries per file.
+					if consecutiveFailures >= maxConsecutiveReconcileFailures {
+						return fmt.Errorf("reconcile stopped after %d files failed in a row: %w", consecutiveFailures, err)
+					}
+				} else {
+					consecutiveFailures = 0
+					stats.FilesIndexed++
+					stats.ChunksCreated += chunks
 				}
-				stats.FilesIndexed++
-				stats.ChunksCreated += chunks
 			} else {
 				stats.FilesSkipped++
 			}

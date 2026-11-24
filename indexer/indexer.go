@@ -31,6 +31,7 @@ type Indexer struct {
 type IndexStats struct {
 	FilesIndexed  int
 	FilesSkipped  int
+	FilesFailed   int // could not be indexed (e.g. embedding failed); left for a later walk
 	ChunksCreated int
 	FilesRemoved  int
 	Duration      time.Duration
@@ -203,6 +204,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			chunks, err := idx.IndexFile(ctx, file)
 			if err != nil {
 				log.Printf("Failed to index %s: %v", file.Path, err)
+				stats.FilesFailed++
 				continue
 			}
 			stats.FilesIndexed++

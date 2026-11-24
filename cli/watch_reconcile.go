@@ -363,10 +363,14 @@ func reconcileWorkspaceProjectWithDocuments(ctx context.Context, r *workspacePro
 		return err
 	}
 	// A receipt is only written after vector, symbol and RPG stores succeeded.
-	if err := r.idx.CompleteGitScan(ctx, before); err != nil {
-		return err
+	// A file that failed to embed has no document and no snapshot entry, so a
+	// receipt would let later starts skip it until git changes.
+	if stats.FilesFailed == 0 {
+		if err := r.idx.CompleteGitScan(ctx, before); err != nil {
+			return err
+		}
 	}
-	log.Printf("[%s] Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped (took %s)",
-		r.project.Name, stats.FilesIndexed, stats.ChunksCreated, stats.FilesRemoved, stats.FilesSkipped, stats.Duration.Round(time.Millisecond))
+	log.Printf("[%s] Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped, %d failed (took %s)",
+		r.project.Name, stats.FilesIndexed, stats.ChunksCreated, stats.FilesRemoved, stats.FilesSkipped, stats.FilesFailed, stats.Duration.Round(time.Millisecond))
 	return nil
 }
